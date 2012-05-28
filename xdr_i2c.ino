@@ -8,7 +8,7 @@
 #define SCL_PIN A5
 
 uint8_t PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
-uint8_t rds_buffer[2], pi_buffer[2] = {0x00}, pi_ok_buffer[2] = {0x00};
+uint8_t rds_buffer[4], pi_buffer[2] = {0x00}, pi_ok_buffer[2] = {0x00};
 unsigned long timer = 0, rds_timer = 0;
 
 const uint8_t FM0[] PROGMEM = {0xFF, 0xFD, 0xFF, 0xF9, 0xFF, 0xF4, 0xFF, 0xF4, 0xFF, 0xFA, 0x00, 0x0A, 0x00, 0x20, 0x00, 0x34, 0x00, 0x3A, 0x00, 0x27, 0xFF, 0xF6, 0xFF, 0xB1, 0xFF, 0x6F, 0xFF, 0x4F, 0xFF, 0x6E, 0xFF, 0xDA, 0x00, 0x82, 0x01, 0x35, 0x01, 0xAB, 0x01, 0x9C, 0x00, 0xDD, 0xFF, 0x7C, 0xFD, 0xCC, 0xFC, 0x5D, 0xFB, 0xDC, 0xFC, 0xDE, 0xFF, 0xAF, 0x04, 0x2B, 0x09, 0xB3, 0x0F, 0x4E, 0x13, 0xDF, 0x16, 0x6F};
@@ -46,7 +46,7 @@ const uint8_t AM14[] PROGMEM = {0x00, 0x03, 0x00, 0x0A, 0x00, 0x08, 0xFF, 0xF5, 
 
 const uint8_t* const FIR_table[] = {FM0, FM1, FM2, FM3, FM4, FM5, FM6, FM7, FM8, FM9, FM10, FM11, FM12, FM13, FM14, FM15, AM0, AM1, AM2, AM3, AM4, AM5, AM6, AM7, AM8, AM9, AM10, AM11, AM12, AM13, AM14};
 
-uint8_t default_FIR_table [] = {23, 24, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7};
+uint8_t default_FIR_table [] = {23, 24, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 
 TwiMaster xdr(false);
 
@@ -118,7 +118,7 @@ void loop()
       
     if(Serial.available() > 0)
     {
-      char action, buff[10];
+      char action, buff[20];
       action = Serial.read();
   
       unsigned int tmp, i=0;
@@ -127,7 +127,7 @@ void loop()
         if (Serial.available() > 0)
         {
           buff[i] = Serial.read();
-          if(buff[i] == 0x0A||i==9)
+          if(buff[i] == 0x0A||i==19)
           {
             buff[i] = 0x00;
             break;
@@ -157,44 +157,7 @@ void loop()
           PLLM = tmp>>8 & 0xFF;
           PLLL = tmp&0xFF;
 
-          // alignment of the antenna circuit
-          if(freq>=107300)
-            DAA = 52;
-          else if(freq>=104500)
-            DAA = 53;
-          else if(freq>=100400)
-            DAA = 54;
-          else if(freq>=97500)
-            DAA = 55;
-          else if(freq>=95600)
-            DAA = 56;
-          else if(freq>=92900)
-            DAA = 57;
-          else if(freq>=90500)
-            DAA = 58;
-          else if(freq>=87800)
-            DAA = 59;
-          else if(freq>=87000)
-            DAA = 60;
-          else if(freq>=85000)
-            DAA = 61;
-          else if(freq>=84000)
-            DAA = 62;
-          else if(freq>=83000)
-            DAA = 63;
-          else if(freq>=78000)
-            DAA = 64;
-          else if(freq>=76000)
-            DAA = 65;
-          else if(freq>=74000)
-            DAA = 66;
-          else if(freq>=73000)
-            DAA = 67;
-          else if(freq>=70000)
-            DAA = 69;
-          else
-            DAA = 70;
-  
+          align(freq);  
           tune();
           Serial.print("T");
           serialHex(PLLM);
@@ -224,7 +187,7 @@ void loop()
          tune();   
        break;
   
-       case 'F': // change FIR filters (takes about 100ms with3 400kHz I2C)
+       case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
          tmp = atoi(buff);
          Serial.print("F");
          if(tmp >= 0 && tmp <= 31)
@@ -250,7 +213,35 @@ void loop()
          Serial.print("D");
          Serial.println(tmp);
        break;
-        
+       
+       case 'U': // spectrum usage (Us,x,y)
+       // reads signal levels from x to y frequency with s step
+       // example: U100,87500,108000  for CCIR
+       //          U30,65900,73970    for OIRT
+       {
+         long data[3];
+         int num=0, pos=0;
+         char buff2[7];
+         for(int i=0; i<=strlen(buff); i++)
+         {
+           if(buff[i] != ',' && buff[i] != 0x00)
+           {
+             buff2[pos] = buff[i];
+             pos++;
+           }
+           else
+           {
+             buff2[pos] = 0x00;
+             pos=0;
+             data[num]=atol(buff2);
+             num++;
+           }
+         } 
+         Serial.print("U");
+         spectrumUsage(data[0], data[1], data[2]);
+       }
+       break;
+       
        case 'X': // shutdown
          TWCR = 0; // release SDA and SCL lines used by hardware I2C
          digitalWrite(RESET_PIN, LOW);
@@ -413,10 +404,17 @@ void RDS()
     break;
     case 0x84: // block B
     case 0x85: // block B (max. 2 bit correction)
-      // we will wait for block D before sending anything to the serial
+      // we will wait for block C & D before sending anything to the serial
       rds_buffer[0] = buffer[0];
       rds_buffer[1] = buffer[1];
+      rds_buffer[2] = 0x00;
+      rds_buffer[3] = 0x00;
       rds_timer = millis();
+    break;
+    case 0x88: // block C
+    case 0x89: // block C (max. 2 bit correction)
+      rds_buffer[2] = buffer[0];
+      rds_buffer[3] = buffer[1];
     break;
     case 0x8C: // block D
     case 0x8D: // block D (max. 2 bit correction)
@@ -426,6 +424,8 @@ void RDS()
          Serial.print("R"); 
          serialHex(rds_buffer[0]);
          serialHex(rds_buffer[1]);
+         serialHex(rds_buffer[2]);
+         serialHex(rds_buffer[3]);
          serialHex(buffer[0]);
          serialHex(buffer[1]); 
          Serial.println();
@@ -445,4 +445,79 @@ uint8_t querySAF(uint8_t addr1, uint8_t addr2, uint8_t addr3)
     buffer = xdr.read(true);
   xdr.stop();
   return buffer;
+}
+
+void spectrumUsage(int step, long start, long stop)
+{
+  uint8_t _PLLM = PLLM, _PLLL = PLLL, _DAA = DAA, _AGC = AGC, _BAND = BAND; // buffer current settings
+  long tmp, freq;
+  for(int i=0; i<16; i++)
+    coeff(i, 2); // fixed 90kHz bandwidth
+  BAND = 0x31;
+  tmp = (start - 87500)/5 + 19640;  
+  for(int i=0; i<=((stop-start)/step); i++)
+  {
+    PLLM = tmp>>8 & 0xFF;
+    PLLL = tmp&0xFF;
+    freq = start + i*step;
+    align(freq);
+    tune();
+    Serial.print(freq, DEC);
+    Serial.print("=");
+    delay(4);
+    Serial.print(querySAF(0x03, 0x00, 0x92), DEC);
+    Serial.print(" ");
+    tmp+=step/5;
+  }
+  Serial.println();
+  PLLM = _PLLM;
+  PLLL = _PLLL;
+  DAA = _DAA;
+  AGC = _AGC;
+  BAND = _BAND;
+  tune();
+  for(int i=0; i<16; i++)
+    coeff(i, default_FIR_table[i]);
+}
+
+void align(long freq)
+{
+  // alignment of the antenna circuit
+  // these values are individual for each tuner!
+  if(freq>=107300)
+    DAA = 52;
+  else if(freq>=104500)
+    DAA = 53;
+  else if(freq>=100400)
+    DAA = 54;
+  else if(freq>=97500)
+    DAA = 55;
+  else if(freq>=95600)
+    DAA = 56;
+  else if(freq>=92900)
+    DAA = 57;
+  else if(freq>=90500)
+    DAA = 58;
+  else if(freq>=87800)
+    DAA = 59;
+  else if(freq>=87000)
+    DAA = 60;
+  else if(freq>=85000)
+    DAA = 61;
+  else if(freq>=84000)
+    DAA = 62;
+  else if(freq>=83000)
+    DAA = 63;
+  else if(freq>=78000)
+    DAA = 64;
+  else if(freq>=76000)
+    DAA = 65;
+  else if(freq>=74000)
+    DAA = 66;
+  else if(freq>=73000)
+    DAA = 67;
+  else if(freq>=70000)
+    DAA = 69;
+  else
+    DAA = 70;
 }
