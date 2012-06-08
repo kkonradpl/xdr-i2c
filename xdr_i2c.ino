@@ -2,12 +2,13 @@
 #include <I2cMaster.h>
 #include <IRremote.h>
 #define RDS_PIN 2
-// IR_PIN 3 unchangeable
+// IR_PIN 3
 #define RESET_PIN 4
 #define SDA_PIN A4
 #define SCL_PIN A5
 
-uint8_t PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
+uint8_t mode; // 1=FM, 2=AM
+uint8_t CONTROL = 0x00, PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
 uint8_t rds_buffer[4], pi_buffer[2] = {0x00}, pi_ok_buffer[2] = {0x00};
 unsigned long timer = 0, rds_timer = 0;
 
@@ -46,16 +47,23 @@ const uint8_t AM14[] PROGMEM = {0x00, 0x03, 0x00, 0x0A, 0x00, 0x08, 0xFF, 0xF5, 
 
 const uint8_t* const FIR_table[] = {FM0, FM1, FM2, FM3, FM4, FM5, FM6, FM7, FM8, FM9, FM10, FM11, FM12, FM13, FM14, FM15, AM0, AM1, AM2, AM3, AM4, AM5, AM6, AM7, AM8, AM9, AM10, AM11, AM12, AM13, AM14};
 
-uint8_t default_FIR_table [] = {23, 24, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+uint8_t default_FIR_table[2][16] =
+{
+   {24, 0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, // FM 
+   {29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29} // AM (?)
+};
 
 TwiMaster xdr(false);
 
 void serialHex(uint8_t);
 void deemphasis(uint8_t);
 void coeff(int, int);
+void FIR(int8_t);
 void tune();
 void RDS();
 uint8_t querySAF(uint8_t, uint8_t, uint8_t);
+void spectrumUsage(int, long, long);
+void align(long);
 
 void setup(void)
 {
@@ -74,26 +82,27 @@ void setup(void)
     irsend.sendSony(0xA8BC8, 20); // POWER
     delay(75);
   }
-  delay(2500);
-  for (int i=0; i<3; i++)
+  delay(5500);
+/*  for (int i=0; i<3; i++)
   {
     irsend.sendSony(0xF6BC8, 20); // BAND
     delay(75);
   }
-  delay(3000);
+  delay(3000);*/
 
   pinMode(RESET_PIN, OUTPUT);
   digitalWrite(RESET_PIN, HIGH);
-  delay(500);
+  delay(100);
   
   pinMode(SDA_PIN, OUTPUT);
   pinMode(SCL_PIN, OUTPUT);
   digitalWrite(SDA_PIN, HIGH);
   digitalWrite(SCL_PIN, HIGH);
   
+  goFM();
+  
   // write the FIR coefficients
-  for(int i=0; i<16; i++)
-    coeff(i, default_FIR_table[i]);
+  FIR(-1);
   
   // RDS settings
   xdr.start(0x38 | I2C_WRITE);
@@ -138,20 +147,69 @@ void loop()
 
       switch (action)
       {
-        case 'T': // frequency change
+        case 'T': // frequency change ***Modified by F4CMB***
         {
           long freq = atol(buff);
-          if(freq % 50)
+ 
+          if ((freq>=60000) && (freq<=137000)) //FM BAND
           {
-            tmp = 19640 + (freq-87500)/5;
-            BAND = 0x31; // 5kHz step, fref=10kHz
-          } 
-          else
+            if(freq % 50)
+            {
+              tmp = ((freq+10700)*2)/10;
+              BAND = B00110001; // 5kHz step, fref=10kHz
+            } 
+            else
+            {
+              // we use 50kHz step if possible, because
+              // in other cases the audio output isn't clear
+              tmp = ((freq+10700)*2)/100;
+              BAND = B00100001; // 50kHz step, fref=100kHz
+            }
+          }
+  /*        if ((freq>=76000) && (freq<=87499)) //JAPAN BAND
           {
-            // we use 50kHz step if possible, because
-            // in other cases the audio output isn't clear
-            tmp = 1964 + (freq-87500)/50;
-            BAND = 0x21; // 50kHz step, fref=100kHz
+            BAND = B01000011;
+            tmp=((freq-10700)*3)/100;
+          }
+          if ((freq>=60000) && (freq<=75999)) //OIRT BAND
+          {
+            BAND = B01001111;
+            tmp=((freq-10700)*3)/20;
+          }
+          if ((freq>=108050) && (freq<=137000)) //AIR BAND (customized mode)
+          {
+            BAND = B00100001;
+            tmp=((freq+10700)*2)/100;
+          } */
+          if ((freq>=137000) && (freq<=200000)) //WB BAND
+          {
+             BAND = B00001001;
+            tmp=((freq+10700)*1)/25;
+          }
+          if ((freq>=100) && (freq<=1900)) //LW & MW BAND
+          {
+            BAND = B11101101;
+            tmp=((freq+10700)*20)/20;
+          }
+          if ((freq>=1901) && (freq<=5899)) // AM SW 120m to 60m
+          {
+            BAND = B11010001;
+            tmp=((freq+10700)*16)/10;
+          }    
+          if ((freq>=5900) && (freq<=13870)) // AM SW 49m to 22m
+          {
+            BAND = B10110001;
+            tmp=((freq+10700)*10)/10;
+          }
+          if ((freq>=13871) && (freq<=19020)) // AM SW 25m to 15m
+          {
+            BAND = B10010001;
+            tmp=((freq+10700)*8)/10;
+          }
+          if ((freq>=19021) && (freq<=30000)) // AM SW 16m to 11m
+          {
+            BAND = B01110001;
+            tmp=((freq+10700)*6)/10;
           }
 
           PLLM = tmp>>8 & 0xFF;
@@ -172,12 +230,12 @@ void loop()
           tmp = atoi(buff);
           switch (tmp)
           {
-             case 0: AGC &= 0b11110011; break; // 00 24mV
-             case 1: AGC &= 0b11110111;
-                     AGC |= 0b00000100; break; // 01 17mV
-             case 2: AGC |= 0b00001000;
-                     AGC &= 0b11111011; break; // 10 12mV
-             case 3: AGC |= 0b00001100; break; // 11 9mV
+             case 0: AGC &= B11110011; break; // 00 24mV
+             case 1: AGC &= B11110111;
+                     AGC |= B00000100; break; // 01 17mV
+             case 2: AGC |= B00001000;
+                     AGC &= B11111011; break; // 10 12mV
+             case 3: AGC |= B00001100; break; // 11 9mV
           }  
           tune();   
        break;
@@ -189,22 +247,9 @@ void loop()
   
        case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
          tmp = atoi(buff);
+         FIR(tmp);
          Serial.print("F");
-         if(tmp >= 0 && tmp <= 31)
-         {
-           // fixed filter bandwidth
-           // write the same FIR into each memory bank
-           Serial.println(tmp);
-           for(int i=0; i<16; i++)
-             coeff(i, tmp);
-         } 
-         else
-         {
-           // adaptive filter bandwidth
-           Serial.println("?");
-           for(int i=0; i<16; i++)
-             coeff(i, default_FIR_table[i]);
-         }
+         Serial.println(tmp);
        break;
        
        case 'D': // change the de-emphasis
@@ -212,6 +257,30 @@ void loop()
          deemphasis(tmp);
          Serial.print("D");
          Serial.println(tmp);
+       break;
+       
+       case 'M': // change the mode (added by F4CMB)
+         tmp = atoi(buff);
+         switch (tmp)
+          {
+             case 1: goFM(); break;
+             case 2: goAM(); break;
+//           case 3: goNFM();break;
+          }  
+          tune();   
+       break;
+       
+       case 'G': // RF/IF Gain
+         if(buff[0] == '1') // FM RF +6dB gain
+           CONTROL |= B10000000;
+         else // FM RF standard gain
+           CONTROL &= B01111111;
+         
+         if(buff[1] == '1') // IF +6dB gain
+           CONTROL |= B00010000;
+         else // IF standard gain
+           CONTROL &= B11101111;
+         tune();
        break;
        
        case 'U': // spectrum usage (Us,x,y)
@@ -257,7 +326,7 @@ void loop()
     if((millis()-timer) >= 100)
     {
       Serial.print("S");
-      Serial.println(querySAF(0x03, 0x00, 0x92), DEC);
+      Serial.println(querySAF(0x03, 0x00, ((mode==1)?0x92:0x6E)), DEC);
       timer = millis();
     }    
     
@@ -311,6 +380,23 @@ void coeff(int num, int fir)
   }
 }
 
+void FIR(int8_t f)
+{
+  if(f >= 0 && f <= 30)
+  {
+    // fixed filter bandwidth
+    // write the same FIR into each memory bank
+    for(int i=0; i<16; i++)
+      coeff(i, f);
+  }
+  else
+  {
+    // adaptive filter bandwidth
+    for(int i=0; i<16; i++)
+      coeff(i, default_FIR_table[(mode-1)][i]);
+  }
+}
+
 void tune() 
 {
   xdr.start(0x38 | I2C_WRITE);
@@ -319,7 +405,7 @@ void tune()
     xdr.write(0xFF);
   xdr.restart(0xC4 | I2C_WRITE);
     xdr.write(0x80);
-    xdr.write(0x00);
+    xdr.write(CONTROL);
     xdr.write(PLLM);
     xdr.write(PLLL);
     xdr.write(DAA);
@@ -340,6 +426,444 @@ void tune()
   pi_buffer[1]=0x00;
   pi_ok_buffer[0]=0x00;
   pi_ok_buffer[1]=0x00;
+}
+
+void goAM() //added by F4CMB
+{
+  xdr.start(0x38 | I2C_WRITE);     // set device address and write mode
+  xdr.write(0x0D);
+  xdr.write(0x14);
+  xdr.write(0x89);
+  xdr.write(0x02);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x51);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x0F);
+  xdr.write(0xF9);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x1F);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x10);
+  xdr.write(0x41);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0xE7);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE); 
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0xE8);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x02);
+  xdr.write(0x1B);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x02);
+  xdr.write(0x1C);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE); 
+  xdr.write(0x03);
+  xdr.write(0x11);
+  xdr.write(0xF6);
+  xdr.write(0x00);
+  xdr.write(0xE9);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x10);
+  xdr.write(0x2E);
+  xdr.write(0x07);
+  xdr.write(0xFF);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE); 
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0xC6);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);; 
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0xC7);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE); 
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0xC4);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x03);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x06);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x3C);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE); 
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x07);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x3D);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x09);
+  xdr.write(0x01);
+  xdr.write(0x2E);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.write(0x1A);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x01);
+  xdr.write(0x0F);
+  xdr.write(0xF5);
+  xdr.write(0xE2);
+  xdr.write(0x76);
+  xdr.write(0x28);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x05);
+  xdr.write(0x0F);
+  xdr.write(0xF5);
+  xdr.write(0xE2);
+  xdr.write(0x75);
+  xdr.write(0xC1);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x03);
+  xdr.write(0x11);
+  xdr.write(0x27);
+  xdr.write(0x0F);
+  xdr.write(0xEC);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);  
+  xdr.write(0x03);
+  xdr.write(0x10);
+  xdr.write(0x11);
+  xdr.write(0x07);
+  xdr.write(0x21);
+  xdr.stop();
+  mode = 2;
+  FIR(-1);
+}
+
+void goFM() // added by F4CMB
+{
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x0D);
+  xdr.write(0x14);
+  xdr.write(0x89);
+  xdr.write(0x02);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x0D);
+  xdr.write(0x14);
+  xdr.write(0x88);
+  xdr.write(0x05);
+  xdr.write(0x73);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x11);
+  xdr.write(0xF7);
+  xdr.write(0x0F);
+  xdr.write(0xC0);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x52);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x0F);
+  xdr.write(0xF1);
+  xdr.write(0xB1);
+  xdr.write(0x10);
+  xdr.write(0x40);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x10);
+  xdr.write(0x41);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x6C);
+  xdr.write(0x07);
+  xdr.write(0xFF);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x6D);
+  xdr.write(0x0F);
+  xdr.write(0x6B);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x6E);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x6F);
+  xdr.write(0x04);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x70);
+  xdr.write(0x01);
+  xdr.write(0x9A);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x71);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x76);
+  xdr.write(0x00);
+  xdr.write(0x03);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x77);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x78);
+  xdr.write(0x00);
+  xdr.write(0x02);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x79);
+  xdr.write(0x00);
+  xdr.write(0x03);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x10);
+  xdr.write(0x7F);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x01);
+  xdr.write(0xAD);
+  xdr.write(0x0F);
+  xdr.write(0xC0);
+  xdr.write(0xFC);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x01);
+  xdr.write(0xAF);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x00);
+  xdr.write(0x67);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x0C);
+  xdr.stop();
+//  xdr.start(0x38 | I2C_WRITE); // 75 uS deamphasis
+//  xdr.write(0x03);
+//  xdr.write(0x11);
+//  xdr.write(0xD7);
+//  xdr.write(0x01);
+//  xdr.write(0xF6);
+//  xdr.write(0x05);
+//  xdr.write(0xC3);
+//  xdr.write(0x00);
+//  xdr.write(0x85);
+//  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x11);
+  xdr.write(0xF6);
+  xdr.write(0x00);
+  xdr.write(0xE9);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x10);
+  xdr.write(0x2E);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0xC6);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0xC7);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x0D);
+  xdr.write(0x00);
+  xdr.write(0xC4);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x41);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x06);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x38);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x07);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x39);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x08);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x3A);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x00);
+  xdr.write(0x09);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x3B);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x09);
+  xdr.write(0x01);
+  xdr.write(0x2E);
+  xdr.write(0x00);
+  xdr.write(0x01);
+  xdr.write(0x37);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x01);
+  xdr.write(0x0F);
+  xdr.write(0xF5);
+  xdr.write(0xE2);
+  xdr.write(0x76);
+  xdr.write(0x28);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x0F);
+  xdr.write(0xF5);
+  xdr.write(0xE2);
+  xdr.write(0x50);
+  xdr.write(0x8D);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x05);
+  xdr.write(0x0F);
+  xdr.write(0xF9);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x17);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x03);
+  xdr.write(0x10);
+  xdr.write(0x11);
+  xdr.write(0x06);
+  xdr.write(0x5A);
+  xdr.stop();
+  xdr.start(0x38 | I2C_WRITE);
+  xdr.write(0x00);
+  xdr.write(0x00);
+  xdr.write(0x35);
+  xdr.write(0x00);
+  xdr.write(0x40);
+  xdr.stop();
+  mode = 1;
+  FIR(-1); // adaptive filter bandwidth
 }
 
 
@@ -451,8 +975,7 @@ void spectrumUsage(int step, long start, long stop)
 {
   uint8_t _PLLM = PLLM, _PLLL = PLLL, _DAA = DAA, _AGC = AGC, _BAND = BAND; // buffer current settings
   long tmp, freq;
-  for(int i=0; i<16; i++)
-    coeff(i, 2); // fixed 90kHz bandwidth
+  FIR(2); // fixed 90kHz bandwidth
   BAND = 0x31;
   tmp = (start - 87500)/5 + 19640;  
   for(int i=0; i<=((stop-start)/step); i++)
@@ -476,8 +999,7 @@ void spectrumUsage(int step, long start, long stop)
   AGC = _AGC;
   BAND = _BAND;
   tune();
-  for(int i=0; i<16; i++)
-    coeff(i, default_FIR_table[i]);
+  FIR(-1); // return to adaptive filter bandwidth
 }
 
 void align(long freq)
