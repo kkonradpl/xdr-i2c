@@ -7,11 +7,15 @@
 #define SDA_PIN A4
 #define SCL_PIN A5
 
+#define PI_BUFFER_SIZE 64
+
 uint8_t mode; // 1=FM, 2=AM
 uint8_t CONTROL = 0x00, PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
-uint8_t rds_buffer[4], pi_buffer[2] = {0x00}, pi_ok_buffer[2] = {0x00};
-uint16_t fast_pi_buffer[50] = {0x00};
-uint8_t fast_pi_counter=0;
+
+uint16_t pi_buffer[PI_BUFFER_SIZE] = {0x0000};
+bool pi_checked = false;
+uint8_t pi_counter = 0;
+uint8_t rds_buffer[4]; // for block B and C
 uint32_t timer = 0, rds_timer = 0;
 
 const uint8_t FM0[] PROGMEM = {0xFF, 0xFD, 0xFF, 0xF9, 0xFF, 0xF4, 0xFF, 0xF4, 0xFF, 0xFA, 0x00, 0x0A, 0x00, 0x20, 0x00, 0x34, 0x00, 0x3A, 0x00, 0x27, 0xFF, 0xF6, 0xFF, 0xB1, 0xFF, 0x6F, 0xFF, 0x4F, 0xFF, 0x6E, 0xFF, 0xDA, 0x00, 0x82, 0x01, 0x35, 0x01, 0xAB, 0x01, 0x9C, 0x00, 0xDD, 0xFF, 0x7C, 0xFD, 0xCC, 0xFC, 0x5D, 0xFB, 0xDC, 0xFC, 0xDE, 0xFF, 0xAF, 0x04, 0x2B, 0x09, 0xB3, 0x0F, 0x4E, 0x13, 0xDF, 0x16, 0x6F};
@@ -51,20 +55,20 @@ const uint8_t* const FIR_table[] = {FM0, FM1, FM2, FM3, FM4, FM5, FM6, FM7, FM8,
 
 uint8_t default_FIR_table[2][16] =
 {
-   {24, 0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, // FM 
-   {29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29} // AM (?)
+   {24, 0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, // FM 
+   {29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29}, // AM (?)
 };
 
 TwiMaster xdr(false);
 
 void serialHex(uint8_t);
 void deemphasis(uint8_t);
-void coeff(int, int);
+void coeff(uint8_t, uint8_t);
 void FIR(int8_t);
 void tune();
 void RDS();
 uint8_t querySAF(uint8_t, uint8_t, uint8_t);
-void spectrumUsage(int, long, long);
+void spectrumUsage(long, long, int);
 void align(long);
 
 void setup(void)
@@ -77,20 +81,14 @@ void setup(void)
   
   while(!(Serial.available()>0)); // wait for any data on serial before starting up
   
-  // IR power up & FM band
+  // IR power up
   IRsend irsend;
-  for (int i=0; i<3; i++)
+  for (uint8_t i=0; i<3; i++)
   {
     irsend.sendSony(0xA8BC8, 20); // POWER
     delay(75);
   }
   delay(5500);
-/*  for (int i=0; i<3; i++)
-  {
-    irsend.sendSony(0xF6BC8, 20); // BAND
-    delay(75);
-  }
-  delay(3000);*/
 
   pinMode(RESET_PIN, OUTPUT);
   digitalWrite(RESET_PIN, HIGH);
@@ -130,208 +128,215 @@ void loop()
     if(Serial.available() > 0)
     {
       char action, buff[20];
+      uint16_t tmp;
+      uint8_t i = 0;
+
       action = Serial.read();
-  
-      unsigned int tmp, i=0;
-      while(1)
+      if(action != '\n')
       {
-        if (Serial.available() > 0)
+        while(1)
         {
-          buff[i] = Serial.read();
-          if(buff[i] == 0x0A||i==19)
+          if (Serial.available() > 0)
           {
-            buff[i] = 0x00;
-            break;
-          }
-          i++;
-        }
-      }
-
-      switch (action)
-      {
-        case 'T': // frequency change ***Modified by F4CMB***
-        {
-          long freq = atol(buff);
- 
-          if ((freq>=60000) && (freq<=137000)) //FM BAND
-          {
-            if(freq % 50)
+            buff[i] = Serial.read();
+            if(buff[i] == 0x0A||i==19)
             {
-              tmp = ((freq+10700)*2)/10;
-              BAND = B00110001; // 5kHz step, fref=10kHz
-            } 
-            else
-            {
-              // we use 50kHz step if possible, because
-              // in other cases the audio output isn't clear
-              tmp = ((freq+10700)*2)/100;
-              BAND = B00100001; // 50kHz step, fref=100kHz
+              buff[i] = 0x00;
+              break;
             }
+            i++;
           }
-  /*        if ((freq>=76000) && (freq<=87499)) //JAPAN BAND
-          {
-            BAND = B01000011;
-            tmp=((freq-10700)*3)/100;
-          }
-          if ((freq>=60000) && (freq<=75999)) //OIRT BAND
-          {
-            BAND = B01001111;
-            tmp=((freq-10700)*3)/20;
-          }
-          if ((freq>=108050) && (freq<=137000)) //AIR BAND (customized mode)
-          {
-            BAND = B00100001;
-            tmp=((freq+10700)*2)/100;
-          } */
-          if ((freq>=137000) && (freq<=200000)) //WB BAND
-          {
-             BAND = B00001001;
-            tmp=((freq+10700)*1)/25;
-          }
-          if ((freq>=100) && (freq<=1900)) //LW & MW BAND
-          {
-            BAND = B11101101;
-            tmp=((freq+10700)*20)/20;
-          }
-          if ((freq>=1901) && (freq<=5899)) // AM SW 120m to 60m
-          {
-            BAND = B11010001;
-            tmp=((freq+10700)*16)/10;
-          }    
-          if ((freq>=5900) && (freq<=13870)) // AM SW 49m to 22m
-          {
-            BAND = B10110001;
-            tmp=((freq+10700)*10)/10;
-          }
-          if ((freq>=13871) && (freq<=19020)) // AM SW 25m to 15m
-          {
-            BAND = B10010001;
-            tmp=((freq+10700)*8)/10;
-          }
-          if ((freq>=19021) && (freq<=30000)) // AM SW 16m to 11m
-          {
-            BAND = B01110001;
-            tmp=((freq+10700)*6)/10;
-          }
-
-          PLLM = tmp>>8 & 0xFF;
-          PLLL = tmp&0xFF;
-
-          align(freq);  
-          tune();
-          Serial.print("T");
-          serialHex(PLLM);
-          serialHex(PLLL);
-          serialHex(AGC);
-          serialHex(BAND);
-          Serial.println();
         }
-        break;
-
-        case 'A': // RF AGC threshold voltage
-          tmp = atoi(buff);
-          switch (tmp)
+      
+        switch (action)
+        {
+          case 'T': // frequency change ***Modified by F4CMB***
           {
-             case 0: AGC &= B11110011; break; // 00 24mV
-             case 1: AGC &= B11110111;
-                     AGC |= B00000100; break; // 01 17mV
-             case 2: AGC |= B00001000;
-                     AGC &= B11111011; break; // 10 12mV
-             case 3: AGC |= B00001100; break; // 11 9mV
-          }  
-          tune();   
-       break;
-
-       case 'V': // set 1st antenna circuit tuning voltage
-         DAA = atoi(buff) & 0x7F; // 0...127 -> 0.1...2.0V
-         tune();   
-       break;
+            long freq = atol(buff);
+   
+            if ((freq>=60000) && (freq<=137000)) //FM BAND
+            {
+              if(freq % 50)
+              {
+                tmp = ((freq+10700)*2)/10;
+                BAND = B00110001; // 5kHz step, fref=10kHz
+              } 
+              else
+              {
+                // we use 50kHz step if possible, because
+                // in other cases the audio output isn't clear
+                tmp = ((freq+10700)*2)/100;
+                BAND = B00100001; // 50kHz step, fref=100kHz
+              }
+            }
+    /*        if ((freq>=76000) && (freq<=87499)) //JAPAN BAND
+            {
+              BAND = B01000011;
+              tmp=((freq-10700)*3)/100;
+            }
+            if ((freq>=60000) && (freq<=75999)) //OIRT BAND
+            {
+              BAND = B01001111;
+              tmp=((freq-10700)*3)/20;
+            }
+            if ((freq>=108050) && (freq<=137000)) //AIR BAND (customized mode)
+            {
+              BAND = B00100001;
+              tmp=((freq+10700)*2)/100;
+            } */
+            if ((freq>=137000) && (freq<=200000)) //WB BAND
+            {
+               BAND = B00001001;
+              tmp=((freq+10700)*1)/25;
+            }
+            if ((freq>=100) && (freq<=1900)) //LW & MW BAND
+            {
+              BAND = B11101101;
+              tmp=((freq+10700)*20)/20;
+            }
+            if ((freq>=1901) && (freq<=5899)) // AM SW 120m to 60m
+            {
+              BAND = B11010001;
+              tmp=((freq+10700)*16)/10;
+            }    
+            if ((freq>=5900) && (freq<=13870)) // AM SW 49m to 22m
+            {
+              BAND = B10110001;
+              tmp=((freq+10700)*10)/10;
+            }
+            if ((freq>=13871) && (freq<=19020)) // AM SW 25m to 15m
+            {
+              BAND = B10010001;
+              tmp=((freq+10700)*8)/10;
+            }
+            if ((freq>=19021) && (freq<=30000)) // AM SW 16m to 11m
+            {
+              BAND = B01110001;
+              tmp=((freq+10700)*6)/10;
+            }
   
-       case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
-         tmp = atoi(buff);
-         FIR(tmp);
-         Serial.print("F");
-         Serial.println(tmp);
-       break;
-       
-       case 'D': // change the de-emphasis
-         tmp = atoi(buff);
-         deemphasis(tmp);
-         Serial.print("D");
-         Serial.println(tmp);
-       break;
-       
-       case 'M': // change the mode (added by F4CMB)
-         tmp = atoi(buff);
-         switch (tmp)
-          {
-             case 1: goFM(); break;
-             case 2: goAM(); break;
-//           case 3: goNFM();break;
-          }  
-          tune();   
-       break;
-       
-       case 'G': // RF/IF Gain
-         if(buff[0] == '1') // FM RF +6dB gain
-           CONTROL |= B10000000;
-         else // FM RF standard gain
-           CONTROL &= B01111111;
-         
-         if(buff[1] == '1') // IF +6dB gain
-           CONTROL |= B00010000;
-         else // IF standard gain
-           CONTROL &= B11101111;
-         tune();
-       break;
-       
-       case 'U': // spectrum usage (Us,x,y)
-       // reads signal levels from x to y frequency with s step
-       // example: U100,87500,108000  for CCIR
-       //          U30,65900,73970    for OIRT
-       {
-         long data[3];
-         int num=0, pos=0;
-         char buff2[7];
-         for(int i=0; i<=strlen(buff); i++)
-         {
-           if(buff[i] != ',' && buff[i] != 0x00)
-           {
-             buff2[pos] = buff[i];
-             pos++;
-           }
+            PLLM = tmp>>8 & 0xFF;
+            PLLL = tmp&0xFF;
+  
+            align(freq);  
+            tune();
+            Serial.print('T');
+            serialHex(PLLM);
+            serialHex(PLLL);
+            serialHex(AGC);
+            serialHex(BAND);
+            Serial.println();
+          }
+          break;
+  
+          case 'A': // RF AGC threshold voltage
+            tmp = atoi(buff);
+            switch (tmp)
+            {
+               case 0: AGC &= B11110011; break; // 00 24mV
+               case 1: AGC &= B11110111;
+                       AGC |= B00000100; break; // 01 17mV
+               case 2: AGC |= B00001000;
+                       AGC &= B11111011; break; // 10 12mV
+               case 3: AGC |= B00001100; break; // 11 9mV
+            }
+            tune();
+         break;
+  
+         case 'V': // set 1st antenna circuit tuning voltage
+           DAA = atoi(buff) & 0x7F; // 0...127 -> 0.1...2.0V
+           tune();   
+         break;
+    
+         case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
+           tmp = atoi(buff);
+           FIR(tmp);
+           Serial.print('F');
+           if(tmp>=0&&tmp<=30)
+             Serial.println(tmp);
            else
+             Serial.println('?');
+         break;
+         
+         case 'D': // change the de-emphasis
+           tmp = atoi(buff);
+           deemphasis(tmp);
+           Serial.print('D');
+           Serial.println(tmp);
+         break;
+         
+         case 'M': // change the mode (added by F4CMB)
+           tmp = atoi(buff);
+           switch (tmp)
+            {
+               case 1: goFM(); break;
+               case 2: goAM(); break;
+      //         case 3: goNFM(); break;
+            }
+            tune();   
+         break;
+         
+         case 'G': // RF/IF Gain
+           if(buff[0] == '1') // FM RF +6dB gain
+             CONTROL |= B10000000;
+           else // FM RF standard gain
+             CONTROL &= B01111111;
+           
+           if(buff[1] == '1') // IF +6dB gain
+             CONTROL |= B00010000;
+           else // IF standard gain
+             CONTROL &= B11101111;
+           tune();
+         break;
+         
+         case 'U': // spectrum usage (Us,x,y)
+         // reads signal levels from x to y frequency with s step
+         // example: U87500,108000,100  for CCIR
+         //          U65900,73970,30    for OIRT
+         {
+           long data[3] = {0};
+           uint8_t num=0, pos=0;
+           char buff2[7];
+           for(uint8_t i=0; i<=strlen(buff); i++)
            {
-             buff2[pos] = 0x00;
-             pos=0;
-             data[num]=atol(buff2);
-             num++;
-           }
-         } 
-         Serial.print("U");
-         spectrumUsage(data[0], data[1], data[2]);
-       }
-       break;
-       
-       case 'X': // shutdown
-         TWCR = 0; // release SDA and SCL lines used by hardware I2C
-         digitalWrite(RESET_PIN, LOW);
-         pinMode(RESET_PIN, INPUT);
-         Serial.println("X");
-         asm("jmp 0");
-       break;
-       
+             if(buff[i] != ',' && buff[i] != 0x00)
+             {
+               buff2[pos] = buff[i];
+               pos++;
+             }
+             else
+             {
+               buff2[pos] = 0x00;
+               pos=0;
+               data[num]=atol(buff2);
+               num++;
+             }
+           } 
+           Serial.print('U');
+           spectrumUsage(data[0], data[1], data[2]);
+         }
+         break;
+         
+         case 'X': // shutdown
+           TWCR = 0; // release SDA and SCL lines used by hardware I2C
+           digitalWrite(RESET_PIN, LOW);
+           pinMode(RESET_PIN, INPUT);
+           Serial.println('X');
+           asm("jmp 0");
+         break;
+         
+        }
       }
     }
 
     // request signal level 10 times per second
     if((millis()-timer) >= 100)
     {
-      Serial.print("S");
+      Serial.print('S');
       Serial.println(querySAF(0x03, 0x00, ((mode==1)?0x92:0x6E)), DEC);
       timer = millis();
-    }    
-    
+    }
+
 }
 
 void serialHex(uint8_t val)
@@ -369,19 +374,16 @@ void deemphasis(uint8_t d)
   xdr.stop();
 }
 
-void coeff(int num, int fir)
+void coeff(uint8_t num, uint8_t fir)
 { 
-  uint8_t addr[2];
+  uint8_t i = 0;
   int address = 0x0C00 + 32 * num;
-  int i = 0;
   while(i<64)
   {
-    addr[0] = address>>8 & 0xFF;
-    addr[1] = address & 0xFF;
     xdr.start(0x38 | I2C_WRITE);
       xdr.write(0x01);
-      xdr.write(addr[0]);
-      xdr.write(addr[1]);
+      xdr.write(address>>8);
+      xdr.write(address & 0xFF);
       xdr.write(pgm_read_byte_near(FIR_table[fir]+(i++)));
       xdr.write(pgm_read_byte_near(FIR_table[fir]+(i++)));
       xdr.write(0x00);
@@ -396,13 +398,13 @@ void FIR(int8_t f)
   {
     // fixed filter bandwidth
     // write the same FIR into each memory bank
-    for(int i=0; i<16; i++)
+    for(uint8_t i=0; i<16; i++)
       coeff(i, f);
   }
   else
   {
     // adaptive filter bandwidth
-    for(int i=0; i<16; i++)
+    for(uint8_t i=0; i<16; i++)
       coeff(i, default_FIR_table[(mode-1)][i]);
   }
 }
@@ -432,10 +434,7 @@ void tune()
     xdr.write(0x60); // fast pi mode
   xdr.stop();
   
-  pi_buffer[0]=0x00;
-  pi_buffer[1]=0x00;
-  pi_ok_buffer[0]=0x00;
-  pi_ok_buffer[1]=0x00;
+  pi_checked = false;
 }
 
 void goAM() //added by F4CMB
@@ -870,7 +869,7 @@ void goFM() // added by F4CMB
   xdr.write(0x00);
   xdr.write(0x35);
   xdr.write(0x00);
-  xdr.write(0x40);
+  xdr.write(0x40); // rds fast pi mode 
   xdr.stop();
   mode = 1;
   FIR(-1); // adaptive filter bandwidth
@@ -879,7 +878,7 @@ void goFM() // added by F4CMB
 
 void RDS()
 {
-  uint8_t rds_status, buffer[2];
+  uint8_t rds_status, buffer[2], current_pi_counter = 0;
   xdr.start(0x38 | I2C_WRITE);
     xdr.write(0x00); 
     xdr.write(0x00); 
@@ -899,58 +898,32 @@ void RDS()
   xdr.stop();
   switch(rds_status)
   {
-    case 0x00:  // fast PI mode (beta version)
-      fast_pi_buffer[fast_pi_counter] = ((buffer[0] << 8) | buffer[1]);
-      for(uint8_t i=0; i<50; i++)
-      {
-        if(i==fast_pi_counter) continue;
-        if(fast_pi_buffer[i]==fast_pi_buffer[fast_pi_counter])
-        {
-          Serial.print("P");
-          serialHex16(fast_pi_buffer[fast_pi_counter]);
-          Serial.println('*');
-          break;
-        }
-      }
-      fast_pi_counter++;
-      fast_pi_counter = fast_pi_counter%50;
-    break;
-    case 0x80: // block A - PI CODE
+    case 0x00: // fast PI mode block (witout sync)
+    case 0x80: // block A 
     case 0x81: // block A (max. 2 bit correction)
     case 0x82: // block A (max. 5 bit correction)
     case 0x90: // block C'
     case 0x91: // block C' (max. 2 bit correction)
     case 0x92: // block C' (max. 5 bit correction)
-      if(pi_buffer[0] == buffer[0] && pi_buffer[1] == buffer[1])
+      pi_buffer[pi_counter] = ((buffer[0] << 8) | buffer[1]);
+      for(uint8_t i=0; i<PI_BUFFER_SIZE; i++)
+        if(pi_buffer[i]==pi_buffer[pi_counter])
+          current_pi_counter++;
+      
+      if(current_pi_counter == 2 && !pi_checked)
       {
-        Serial.print("P");
-        serialHex(buffer[0]);
-        serialHex(buffer[1]);
-        Serial.println();
-        pi_ok_buffer[0] = buffer[0];
-        pi_ok_buffer[1] = buffer[1];
-      } 
-      else if (pi_ok_buffer[0] == buffer[0] && pi_ok_buffer[1] == buffer[1]) 
-      {
-        Serial.print("P");
-        serialHex(buffer[0]);
-        serialHex(buffer[1]);
-        Serial.println();
-        pi_buffer[0] = buffer[0];
-        pi_buffer[1] = buffer[1];
+        Serial.print('P');
+        serialHex16(pi_buffer[pi_counter]);
+        Serial.println('?');
       }
-      else
+      else if(current_pi_counter > 2)
       {
-        if(pi_ok_buffer[0] == 0x00 && pi_ok_buffer[1] == 0x00 && rds_status == 0x80)
-        {
-          Serial.print("P");
-          serialHex(buffer[0]);
-          serialHex(buffer[1]);
-          Serial.println("?");
-        }
-        pi_buffer[0] = buffer[0];
-        pi_buffer[1] = buffer[1];
+        Serial.print('P');
+        serialHex16(pi_buffer[pi_counter]);
+        Serial.println();
+        pi_checked = true;
       }
+      pi_counter = (pi_counter+1)%PI_BUFFER_SIZE;
     break;
     case 0x84: // block B
     case 0x85: // block B (max. 2 bit correction)
@@ -971,7 +944,7 @@ void RDS()
       // is this block related to the block B from buffer?
       if((millis()-rds_timer) < 50)
       {
-         Serial.print("R"); 
+         Serial.print('R'); 
          serialHex(rds_buffer[0]);
          serialHex(rds_buffer[1]);
          serialHex(rds_buffer[2]);
@@ -988,7 +961,7 @@ uint8_t querySAF(uint8_t addr1, uint8_t addr2, uint8_t addr3)
 {
   uint8_t buffer;
   xdr.start(0x38 | I2C_WRITE);
-    xdr.write(addr1); 
+    xdr.write(addr1);
     xdr.write(addr2); 
     xdr.write(addr3);
   xdr.restart(0x38 | I2C_READ);
@@ -997,13 +970,13 @@ uint8_t querySAF(uint8_t addr1, uint8_t addr2, uint8_t addr3)
   return buffer;
 }
 
-void spectrumUsage(int step, long start, long stop)
+void spectrumUsage(long start, long stop, int step)
 {
   uint8_t _PLLM = PLLM, _PLLL = PLLL, _DAA = DAA, _AGC = AGC, _BAND = BAND; // buffer current settings
   long tmp, freq;
   FIR(2); // fixed 90kHz bandwidth
   BAND = 0x31;
-  tmp = (start - 87500)/5 + 19640;  
+  tmp = ((start+10700)*2)/10;
   for(int i=0; i<=((stop-start)/step); i++)
   {
     PLLM = tmp>>8 & 0xFF;
@@ -1012,10 +985,10 @@ void spectrumUsage(int step, long start, long stop)
     align(freq);
     tune();
     Serial.print(freq, DEC);
-    Serial.print("=");
+    Serial.print('=');
     delay(4);
     Serial.print(querySAF(0x03, 0x00, 0x92), DEC);
-    Serial.print(" ");
+    Serial.print(' ');
     tmp+=step/5;
   }
   Serial.println();
