@@ -1,13 +1,19 @@
+#define IR 1
+/* When not using an IR diode, change this to 0 */
+
 #include <avr/pgmspace.h>
 #include <I2cMaster.h>
+#if IR
 #include <IRremote.h>
+#endif
+
 #define RDS_PIN 2
-// IR_PIN 3
+#define IR_PIN 3
 #define RESET_PIN 4
 #define SDA_PIN A4
 #define SCL_PIN A5
 
-#define PI_BUFFER_SIZE 64
+#define PI_BUFFER_SIZE 100
 
 uint8_t mode; // 1=FM, 2=AM
 uint8_t CONTROL = 0x00, PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
@@ -15,6 +21,7 @@ uint8_t CONTROL = 0x00, PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning dat
 uint16_t pi_buffer[PI_BUFFER_SIZE] = {0x0000};
 bool pi_checked = false;
 uint8_t pi_counter = 0;
+uint8_t rds_status_buffer[2];
 uint8_t rds_buffer[4]; // for block B and C
 uint32_t timer = 0, rds_timer = 0;
 
@@ -55,7 +62,7 @@ const uint8_t* const FIR_table[] = {FM0, FM1, FM2, FM3, FM4, FM5, FM6, FM7, FM8,
 
 uint8_t default_FIR_table[2][16] =
 {
-   {24, 0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, // FM 
+   {0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, // FM 
    {29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29} // AM (?)
 };
 
@@ -65,7 +72,7 @@ void serialHex(uint8_t);
 void deemphasis(uint8_t);
 void coeff(uint8_t, uint8_t);
 void FIR(int8_t);
-void tune();
+void tune(boolean rds_sync_reset = true);
 void RDS();
 uint8_t querySAF(uint8_t, uint8_t, uint8_t);
 void spectrumUsage(long, long, int);
@@ -79,8 +86,24 @@ void setup(void)
   pinMode(RESET_PIN, INPUT);
   Serial.begin(115200);
   
-  while(!(Serial.available()>0)); // wait for any data on serial before starting up
+  char c;
   
+  while(true)
+  {
+    if(Serial.available()>0)
+    {
+      c = Serial.read();
+      if(c == 'x')
+      {
+        while(!Serial.available());
+        c = Serial.read();
+        if(c == '\n')
+          break;
+      }
+    }
+  }
+
+  #if IR  
   // IR power up
   IRsend irsend;
   for (uint8_t i=0; i<3; i++)
@@ -89,7 +112,8 @@ void setup(void)
     delay(75);
   }
   delay(5500);
-
+  #endif
+  
   pinMode(RESET_PIN, OUTPUT);
   digitalWrite(RESET_PIN, HIGH);
   delay(100);
@@ -101,9 +125,6 @@ void setup(void)
   
   goFM();
   
-  // write the FIR coefficients
-  FIR(-1);
-  
   // RDS settings
   xdr.start(0x38 | I2C_WRITE);
   xdr.write(0x00); 
@@ -114,8 +135,9 @@ void setup(void)
   xdr.stop();
   
   deemphasis(0); // set 50us de-emphasis as default
-  
-  Serial.println("XDR-F1HD controller is ready.");
+
+  Serial.println();
+  Serial.println("OK");
   while(Serial.available()>0)
     Serial.read(); // clear the serial buffer
 }
@@ -240,12 +262,12 @@ void loop()
                        AGC &= B11111011; break; // 10 12mV
                case 3: AGC |= B00001100; break; // 11 9mV
             }
-            tune();
+            tune(false);
          break;
   
          case 'V': // set 1st antenna circuit tuning voltage
            DAA = atoi(buff) & 0x7F; // 0...127 -> 0.1...2.0V
-           tune();   
+           tune(false);   
          break;
     
          case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
@@ -286,7 +308,7 @@ void loop()
              CONTROL |= B00010000;
            else // IF standard gain
              CONTROL &= B11101111;
-           tune();
+           tune(false);
          break;
          
          case 'U': // spectrum usage (Us,x,y)
@@ -322,6 +344,7 @@ void loop()
            digitalWrite(RESET_PIN, LOW);
            pinMode(RESET_PIN, INPUT);
            Serial.println('X');
+           delay(10);
            asm("jmp 0");
          break;
          
@@ -409,7 +432,7 @@ void FIR(int8_t f)
   }
 }
 
-void tune() 
+void tune(boolean reset_rds_sync)
 {
   xdr.start(0x38 | I2C_WRITE);
     xdr.write(0x00);
@@ -425,16 +448,19 @@ void tune()
     xdr.write(BAND);
   xdr.stop();
   
-  // reset the RDS synchronization
-  xdr.start(0x38 | I2C_WRITE);
-  xdr.write(0x00); 
-  xdr.write(0x00); 
-  xdr.write(0x35);     
-    xdr.write(0x00);     
-    xdr.write(0x60); // fast pi mode
-  xdr.stop();
-  
-  pi_checked = false;
+  if(reset_rds_sync)
+  {
+    // reset the RDS synchronization
+    xdr.start(0x38 | I2C_WRITE);
+    xdr.write(0x00); 
+    xdr.write(0x00); 
+    xdr.write(0x35);     
+      xdr.write(0x00);     
+      xdr.write(0x60); // fast pi mode
+    xdr.stop();
+    
+    pi_checked = false;
+  }
 }
 
 void goAM() //added by F4CMB
@@ -898,7 +924,7 @@ void RDS()
   xdr.stop();
   switch(rds_status)
   {
-    case 0x00: // fast PI mode block (witout sync)
+    case 0x00: // fast PI mode block (without sync)
     case 0x80: // block A 
     case 0x81: // block A (max. 2 bit correction)
     case 0x82: // block A (max. 5 bit correction)
@@ -932,12 +958,15 @@ void RDS()
       rds_buffer[1] = buffer[1];
       rds_buffer[2] = 0x00;
       rds_buffer[3] = 0x00;
+      rds_status_buffer[0] = rds_status;
+      rds_status_buffer[1] = 0x00;
       rds_timer = millis();
     break;
     case 0x88: // block C
     case 0x89: // block C (max. 2 bit correction)
       rds_buffer[2] = buffer[0];
       rds_buffer[3] = buffer[1];
+      rds_status_buffer[1] = rds_status;
     break;
     case 0x8C: // block D
     case 0x8D: // block D (max. 2 bit correction)
@@ -950,7 +979,11 @@ void RDS()
          serialHex(rds_buffer[2]);
          serialHex(rds_buffer[3]);
          serialHex(buffer[0]);
-         serialHex(buffer[1]); 
+         serialHex(buffer[1]);
+         
+         serialHex(rds_status_buffer[0]);
+         serialHex(rds_status_buffer[1]);
+         serialHex(rds_status);
          Serial.println();
       }
     break;
