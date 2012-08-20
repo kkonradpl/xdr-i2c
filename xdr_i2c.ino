@@ -106,7 +106,7 @@ void setup(void)
     }
   }
 
-  #if IR  
+  #if IR
   // IR power up
   for (int i=0; i<10; i++) {
     sendcode(0xA8BC8);
@@ -1022,21 +1022,23 @@ void spectrumUsage(long start, long stop, int step)
 
 /* IR support by F4CMB */
 void sendcode(long code)
-{  
+{
+  cli();
   start();
-  for (int i = 19; i >=0; i--)  {                                        
-    if (code>>i &1 == 1) one(); 
+  for (int i = 19; i >=0; i--) {                       
+    if (code>>i &1 == 1) one();
     else zero();
   }
   delayMicroseconds (15000);
   start();
-  for (int i = 19; i >=0; i--)  {                                        
-    if (code>>i &1 == 1) one(); 
+  for (int i = 19; i >=0; i--) {
+    if (code>>i &1 == 1) one();
     else zero();
   }
+  sei();
 }
 
-void carrier(int time)  
+void carrier(int time)
 {
   for (int i=0; i<(time/30);i++)
   {
