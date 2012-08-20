@@ -3,9 +3,6 @@
 
 #include <avr/pgmspace.h>
 #include <I2cMaster.h>
-#if IR
-#include <IRremote.h>
-#endif
 
 #define RDS_PIN 2
 #define IR_PIN 3
@@ -13,7 +10,7 @@
 #define SDA_PIN A4
 #define SCL_PIN A5
 
-#define PI_BUFFER_SIZE 100
+#define PI_BUFFER_SIZE 64
 
 uint8_t mode; // 1=FM, 2=AM
 uint8_t CONTROL = 0x00, PLLM, PLLL, DAA, AGC = 0xC8, BAND; // TEF6730 tuning data
@@ -76,6 +73,11 @@ void tune(boolean rds_sync_reset = true);
 void RDS();
 uint8_t querySAF(uint8_t, uint8_t, uint8_t);
 void spectrumUsage(long, long, int);
+void sendcode(long code);
+void carrier(int time);
+void start();
+void one();
+void zero();
 void align(long);
 
 void setup(void)
@@ -84,6 +86,7 @@ void setup(void)
   pinMode(SDA_PIN, INPUT);
   pinMode(SCL_PIN, INPUT);
   pinMode(RESET_PIN, INPUT);
+  pinMode(IR_PIN, OUTPUT);
   Serial.begin(115200);
   
   char c;
@@ -105,11 +108,9 @@ void setup(void)
 
   #if IR  
   // IR power up
-  IRsend irsend;
-  for (uint8_t i=0; i<3; i++)
-  {
-    irsend.sendSony(0xA8BC8, 20); // POWER
-    delay(75);
+  for (int i=0; i<10; i++) {
+    sendcode(0xA8BC8);
+    delayMicroseconds(10000);
   }
   delay(5500);
   #endif
@@ -161,7 +162,7 @@ void loop()
           if (Serial.available() > 0)
           {
             buff[i] = Serial.read();
-            if(buff[i] == 0x0A||i==19)
+            if(buff[i] == '\n' || i==19)
             {
               buff[i] = 0x00;
               break;
@@ -191,21 +192,6 @@ void loop()
                 BAND = B00100001; // 50kHz step, fref=100kHz
               }
             }
-    /*        if ((freq>=76000) && (freq<=87499)) //JAPAN BAND
-            {
-              BAND = B01000011;
-              tmp=((freq-10700)*3)/100;
-            }
-            if ((freq>=60000) && (freq<=75999)) //OIRT BAND
-            {
-              BAND = B01001111;
-              tmp=((freq-10700)*3)/20;
-            }
-            if ((freq>=108050) && (freq<=137000)) //AIR BAND (customized mode)
-            {
-              BAND = B00100001;
-              tmp=((freq+10700)*2)/100;
-            } */
             if ((freq>=137000) && (freq<=200000)) //WB BAND
             {
                BAND = B00001001;
@@ -263,6 +249,7 @@ void loop()
                case 3: AGC |= B00001100; break; // 11 9mV
             }
             tune(false);
+            delay(1);
          break;
   
          case 'V': // set 1st antenna circuit tuning voltage
@@ -293,7 +280,6 @@ void loop()
             {
                case 1: goFM(); break;
                case 2: goAM(); break;
-      //         case 3: goNFM(); break;
             }
             tune();   
          break;
@@ -1033,6 +1019,52 @@ void spectrumUsage(long start, long stop, int step)
   tune();
   FIR(-1); // return to adaptive filter bandwidth
 }
+
+/* IR support by F4CMB */
+void sendcode(long code)
+{  
+  start();
+  for (int i = 19; i >=0; i--)  {                                        
+    if (code>>i &1 == 1) one(); 
+    else zero();
+  }
+  delayMicroseconds (15000);
+  start();
+  for (int i = 19; i >=0; i--)  {                                        
+    if (code>>i &1 == 1) one(); 
+    else zero();
+  }
+}
+
+void carrier(int time)  
+{
+  for (int i=0; i<(time/30);i++)
+  {
+    digitalWrite(IR_PIN, HIGH); // approx 40 KHz oscillator
+    delayMicroseconds(12);
+    digitalWrite(IR_PIN, LOW);
+    delayMicroseconds(12);
+  }
+}
+
+void start()
+{
+  carrier(2000);
+  delayMicroseconds(600);
+}
+
+void one()
+{
+  carrier(1200);
+  delayMicroseconds(600);
+}
+
+void zero()
+{
+  carrier(600);
+  delayMicroseconds(600);
+}
+
 
 void align(long freq)
 {

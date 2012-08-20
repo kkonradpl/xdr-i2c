@@ -10,7 +10,6 @@ Thanks to (alphabetical order):
 
 Tested with Seeeduino 3.3V
 
-Uses I2C library from: (i2cv2.zip)
+Requires I2C library: (i2cv2.zip)
 http://forums.adafruit.com/viewtopic.php?f=25&t=13722
-and IR library from:
-http://www.pjrc.com/teensy/td_libs_IRremote.html
+
