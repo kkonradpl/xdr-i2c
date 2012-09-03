@@ -179,7 +179,7 @@ void loop()
    
             if ((freq>=60000) && (freq<=137000)) //FM BAND
             {
-              if(freq % 50)
+              if(freq % 50 || freq>108000)
               {
                 tmp = ((freq+10700)*2)/10;
                 BAND = B00110001; // 5kHz step, fref=10kHz
@@ -257,11 +257,11 @@ void loop()
            tune(false);   
          break;
     
-         case 'F': // change FIR filters (takes about 100ms with 400kHz I2C)
+         case 'F': // change FIR filters
            tmp = atoi(buff);
-           FIR(tmp);
            Serial.print('F');
-           if(tmp>=0&&tmp<=30)
+           FIR(tmp);
+           if(tmp>=0)
              Serial.println(tmp);
            else
              Serial.println('?');
@@ -338,11 +338,12 @@ void loop()
       }
     }
 
-    // request signal level 10 times per second
-    if((millis()-timer) >= 100)
+    // request signal level and stereo/mono 15 times per second
+    if((millis()-timer) >= 67)
     {
       Serial.print('S');
-      Serial.println(querySAF(0x03, 0x00, ((mode==1)?0x92:0x6E)), DEC);
+      Serial.print((querySAF(0x03, 0x10, 0x2C)&&mode==1)?'s':'m'); // 19kHz pilot
+      Serial.println(querySAF(0x03, 0x00, ((mode==1)?0x92:0x6E)), DEC); // signal level
       timer = millis();
     }
 
@@ -403,18 +404,78 @@ void coeff(uint8_t num, uint8_t fir)
 
 void FIR(int8_t f)
 {
-  if(f >= 0 && f <= 30)
+  if(f >= 0)
   {
+    if(mode==2)
+    { // workaround for AM
+      for(uint8_t i=0; i<16; i++)
+        coeff(i, f);
+      return;
+    }
     // fixed filter bandwidth
-    // write the same FIR into each memory bank
-    for(uint8_t i=0; i<16; i++)
-      coeff(i, f);
+    // write the FIR coefficients into $15 filter bank
+    coeff(15, f);
+
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA2); // TDSP1_X_CIBW_1_FirCtlFix
+        xdr.write(0x00);
+        xdr.write(0x00);
+        xdr.write(0x0F); // $15 filter 
+    xdr.stop();
+    
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA5); // TDSP1_X_CIBW_4_FirCtlFix 
+        xdr.write(0x00);
+        xdr.write(0x00);
+        xdr.write(0x0F); // $15 filter 
+    xdr.stop();
+    
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA3); // TDSP1_X_CIBW_1_pFirCtl 
+        xdr.write(0x00);
+        xdr.write(0x01);
+        xdr.write(0xA2); // TDSP1_X_CIBW_1_FirCtlFix 
+    xdr.stop();
+    
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA6); // TDSP1_X_CIBW_4_pFirCtl 
+        xdr.write(0x00);
+        xdr.write(0x01);
+        xdr.write(0xA5); // TDSP1_X_CIBW_4_FirCtlFix 
+    xdr.stop();
+    
   }
-  else
+  else if(mode == 1)
   {
     // adaptive filter bandwidth
     for(uint8_t i=0; i<16; i++)
       coeff(i, default_FIR_table[(mode-1)][i]);
+    
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA3); // TDSP1_X_CIBW_1_pFirCtl 
+        xdr.write(0x00);
+        xdr.write(0x01);
+        xdr.write(0xA1); // TDSP1_X_CIBW_1_FirCtl
+    xdr.stop();
+    
+    xdr.start(0x38 | I2C_WRITE);
+      xdr.write(0x01);
+      xdr.write(0x01);
+      xdr.write(0xA6); // TDSP1_X_CIBW_4_pFirCtl 
+        xdr.write(0x00);
+        xdr.write(0x01);
+        xdr.write(0xA4); // TDSP1_X_CIBW_4_FirCtl
+    xdr.stop();
   }
 }
 
