@@ -714,12 +714,14 @@ void setup(void)
     delay(5500);
 #endif
 
-    digitalWrite(RESET_PIN, HIGH);
-    pinMode(SDA_PIN, OUTPUT);
-    pinMode(SCL_PIN, OUTPUT);
-    digitalWrite(SDA_PIN, HIGH);
-    digitalWrite(SCL_PIN, HIGH);
-    delay(100);
+  pinMode(SDA_PIN, OUTPUT);
+  pinMode(SCL_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, HIGH);
+  digitalWrite(SCL_PIN, HIGH);
+  
+  delay(250);
+  digitalWrite(RESET_PIN, HIGH);
+  delay(100);
 
 #if DSP_INIT
     dsp_write_data(INIT);
