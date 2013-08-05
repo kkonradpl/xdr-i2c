@@ -30,7 +30,7 @@
 
 #define PI_BUFFER_SIZE 64
 #define SERIAL_BUFFER_SIZE 16
-#define INIT 1
+#define INIT 0
 
 #define MODE_FM 0
 #define MODE_AM 1
