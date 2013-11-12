@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2013-08-06
+ *  XDR-I2C 2013-11-12
  *  Copyright (C) 2012-2013  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -19,42 +19,63 @@
 #include <Arduino.h>
 #include <I2cMaster.h>
 #include <avr/pgmspace.h>
-#include "filters.h"
 #include "xdr_f1hd.h"
+#include "filters.h"
+#include "align.h"
 
+// Pinout
 #define RDS_PIN    2
 #define IR_PIN     3
 #define RESET_PIN  4
+#define ANT_A_PIN  8
+#define ANT_B_PIN  9
+#define ANT_C_PIN 10
+#define ANT_D_PIN 11
 #define SDA_PIN   A4
 #define SCL_PIN   A5
 
-#define PI_BUFFER_SIZE 64
+// Serial
 #define SERIAL_BUFFER_SIZE 16
-#define INIT 0
-
-#define MODE_FM 0
-#define MODE_AM 1
-
-char buff[SERIAL_BUFFER_SIZE];
+char buff[SERIAL_BUFFER_SIZE]; 
 uint8_t buff_pos = 0;
 
-int8_t current_filter = -1;
-uint8_t mode;
-
+// TEF6730 IF
 uint8_t CONTROL = 0x00;
 uint16_t PLL;
 uint8_t DAA = 0x00;
 uint8_t AGC = 0xC8;
 uint8_t BAND;
 
+// RDS
+#define PI_BUFFER_SIZE 64
+uint32_t rds_timer = 0;
 uint16_t pi_buffer[PI_BUFFER_SIZE];
-uint8_t rds_buffer[4], rds_status_buffer, pi_pos = 0;
+uint8_t rds_buffer[4];
+uint8_t rds_status_buffer;
+uint8_t pi_pos = 0;
 bool pi_checked = false;
 
-uint32_t timer = 0, rds_timer = 0;
+// Scan
+bool scan_flag = false;
+uint32_t scan_start = 0;
+uint32_t scan_end = 0;
+uint8_t scan_step = 0;
+uint8_t scan_filter = 0;
 
-bool spectrum_flag = false;
-uint32_t spectrum_start = 0, spectrum_end = 0;
+// Antenna switch
+const uint8_t ANT[] = {ANT_A_PIN, ANT_B_PIN, ANT_C_PIN, ANT_D_PIN};
+const uint8_t ANT_n = sizeof(ANT)/sizeof(uint8_t);
+uint8_t current_ant = 0;
+
+// Other
+#define TIMER_INTERVAL 67
+#define INIT 0
+#define MODE_FM 0
+#define MODE_AM 1
+uint8_t mode; // AM/FM
+uint32_t timer = 0; // signal level reporting timer
+int8_t current_filter = -1; // current FIR filter (-1 is adaptive)
+uint16_t volume = 0x07FF; // audio volume control
 
 TwiMaster i2c(false);
 
@@ -62,17 +83,19 @@ uint8_t dsp_query(uint8_t, uint8_t, uint8_t);
 void dsp_write_data(const uint8_t*);
 void dsp_write_coeff(uint8_t, uint8_t);
 void dsp_read_rds();
+void dsp_volume_scaler(uint16_t);
 void dsp_set_filter(int8_t);
 void dsp_set_deemphasis(uint8_t);
 void tune(boolean);
-void tune_freq(uint32_t, boolean);
-void spectrum(uint16_t);
+bool tune_freq(uint32_t);
+void scan(bool);
 void serial_hex(uint8_t);
 void sendcode(uint32_t code);
 void carrier(int time);
 void start();
 void one();
 void zero();
+void ant_switch(uint8_t);
 void align(uint32_t);
 
 #define ADDR1(a) ((a & 0xFF0000) >> 16)
@@ -87,6 +110,15 @@ void setup(void)
     pinMode(RESET_PIN, OUTPUT);
     digitalWrite(RESET_PIN, LOW);
     pinMode(IR_PIN, OUTPUT);
+    pinMode(ANT_A_PIN, OUTPUT);
+    pinMode(ANT_B_PIN, OUTPUT);
+    pinMode(ANT_C_PIN, OUTPUT);
+    pinMode(ANT_D_PIN, OUTPUT);
+    digitalWrite(ANT[0], LOW);
+    digitalWrite(ANT[1], LOW);
+    digitalWrite(ANT[2], LOW);
+    digitalWrite(ANT[3], LOW);
+    digitalWrite(ANT[current_ant], HIGH);
     Serial.begin(115200);
 
     while(true)
@@ -122,22 +154,27 @@ void setup(void)
     dsp_write_data(DSP_INIT);
 #endif
 
-    mode_FM();
-    tune_freq(87500, false);
+    mode_FM(); // switch mode to FM and use adaptive filter bandwidth
+    dsp_volume_scaler(volume); // set max sound volume
     dsp_set_deemphasis(0); // 50us de-emphasis as default
+    tune_freq(87500); // tune to 87.500 MHz
 
     while(Serial.available() > 0)
+    {
         Serial.read(); // clear the serial buffer
+    }
     Serial.print("\nOK\n");
 }
 
 void loop()
 {
     if(!digitalRead(RDS_PIN))
+    {
         dsp_read_rds();
+    }
 
-    // check signal level and 19kHz pilot indicator ~15 times per second
-    if((millis()-timer) >= 67)
+    // check signal level and 19kHz subcarrier every TIMER_INTERVAL
+    if((millis()-timer) >= TIMER_INTERVAL)
     {
         uint32_t buffer;
         i2c.start(DSP_I2C | I2C_WRITE);
@@ -162,7 +199,7 @@ void loop()
         Serial.print('S');
         if(mode == MODE_FM && dsp_query(ADDR1(DSP_ST_19kHz), ADDR2(DSP_ST_19kHz), ADDR3(DSP_ST_19kHz)))
         {
-            Serial.print('s'); // 19kHz pilot
+            Serial.print('s'); // 19kHz subcarrier
         }
         else
         {
@@ -189,7 +226,14 @@ void loop()
                 break;
 
             case 'T': // frequency change
-                tune_freq(atol(buff+1), true);
+                if(tune_freq(atol(buff+1)))
+                {
+                    Serial.print('V');
+                    Serial.print(DAA&0x7F, DEC);
+                    Serial.print("\nT");
+                    Serial.print(get_current_freq(), DEC);
+                    Serial.print('\n');
+                }
                 break;
 
             case 'A': // RF AGC threshold
@@ -221,7 +265,8 @@ void loop()
                 break;
 
             case 'F': // change FIR filters
-                dsp_set_filter(atoi(buff+1));
+                current_filter = atoi(buff+1);
+                dsp_set_filter(current_filter);
                 break;
 
             case 'D': // change the de-emphasis
@@ -264,11 +309,41 @@ void loop()
 
             case 'S':
                 if(buff[1] == 'a')
-                    spectrum_start = atol(buff+2);
+                {
+                    scan_start = atol(buff+2);
+                }
                 else if(buff[1] == 'b')
-                    spectrum_end = atol(buff+2);
-                else if(spectrum_start > 0 && spectrum_end > 0)
-                    spectrum(atoi(buff+1));
+                {
+                    scan_end = atol(buff+2);
+                }
+                else if(buff[1] == 'c')
+                {
+                    scan_step = atol(buff+2);
+                }
+                else if(buff[1] == 'f')
+                {
+                    scan_filter = atol(buff+2);
+                }
+                else if(scan_start > 0 && scan_end > 0 && scan_step > 0  && scan_filter >= 0)
+                {
+                    if(buff[1] == 'm')
+                    {
+                      scan(true); // multiple (continous) scan
+                    }
+                    else
+                    {
+                      scan(false); // single scan
+                    }
+                }
+                break;
+
+            case 'Y': // audio volume scaler
+                volume = atoi(buff+1);
+                dsp_volume_scaler(volume);
+                break;
+
+            case 'Z': // antenna switch  
+                ant_switch(atoi(buff+1));
                 break;
 
             case 'X': // shutdown
@@ -328,9 +403,19 @@ void dsp_write_coeff(uint8_t bank, uint8_t filter)
     }
 }
 
+void dsp_volume_scaler(uint16_t v)
+{
+    i2c.start(DSP_I2C | I2C_WRITE);
+    i2c.write(ADDR1(DSP_VOLUME_SCALER));
+    i2c.write(ADDR2(DSP_VOLUME_SCALER));
+    i2c.write(ADDR3(DSP_VOLUME_SCALER));
+    i2c.write((v >> 8) & 0x07);
+    i2c.write(v & 0xFF);
+    i2c.stop();
+}
+
 void dsp_set_filter(int8_t f)
 {
-    current_filter = f;
     if(f >= 0) // fixed filter bandwidth
     {
         if(mode == MODE_AM)
@@ -544,7 +629,7 @@ void tune(boolean reset_rds_sync)
     i2c.write(BAND);
     i2c.stop();
 
-    if(reset_rds_sync && !spectrum_flag)
+    if(reset_rds_sync && !scan_flag)
     {
         i2c.start(DSP_I2C | I2C_WRITE);
         i2c.write(0x00);
@@ -558,11 +643,11 @@ void tune(boolean reset_rds_sync)
     delay(4);
 }
 
-void tune_freq(uint32_t freq, boolean serial_print) // ***Modified by F4CMB***
+bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
 {
     if ((freq>=55000) && (freq<=137000)) // FM BAND (extended)
     {
-        if(freq % 50 || freq>108000 || spectrum_flag)
+        if(freq % 50 || freq>108000 || scan_flag)
         {
             PLL = ((freq+10700)*2)/10;
             BAND = B00110001; // 5kHz step, fref=10kHz
@@ -601,19 +686,13 @@ void tune_freq(uint32_t freq, boolean serial_print) // ***Modified by F4CMB***
         PLL = ((freq+10700)*6)/10;
     }
     else
-        return;
+    {
+        return false;
+    }
 
     align(freq);
     tune(true);
-
-    if(serial_print)
-    {
-        Serial.print('V');
-        Serial.print(DAA&0x7F, DEC);
-        Serial.print("\nT");
-        Serial.print(get_current_freq(), DEC);
-        Serial.print('\n');
-    }
+    return true;
 }
 
 void mode_FM()
@@ -629,44 +708,51 @@ void mode_AM()
     dsp_write_data(DSP_AM);
 }
 
-void spectrum(uint16_t step)
+void scan(bool continous)
 {
     uint8_t _CONTROL = CONTROL;
     uint16_t _PLL = PLL;
     uint8_t _DAA = DAA;
     uint8_t _AGC = AGC;
     uint8_t _BAND = BAND; // save current settings
-    uint32_t freq = spectrum_start;
-
-    spectrum_flag = true;
-    tune_freq(freq, false);
-    Serial.print('U');
-    while(freq<=spectrum_end)
+    uint32_t freq;
+    
+    scan_flag = true;
+    dsp_volume_scaler(0); // mute
+    dsp_set_filter(scan_filter);
+    tune_freq(scan_start);
+    do
     {
-        tune_freq(freq, false);
-        Serial.print(get_current_freq(), DEC);
-        Serial.print('=');
-        if(mode == MODE_FM)
+        Serial.print('U');
+        for(freq = scan_start; freq <= scan_end; freq += scan_step)
         {
-            Serial.print(dsp_query(ADDR1(DSP_FM_LEVEL), ADDR2(DSP_FM_LEVEL), ADDR3(DSP_FM_LEVEL)), DEC);
+            tune_freq(freq);
+            Serial.print(get_current_freq(), DEC);
+            Serial.print('=');
+            if(mode == MODE_FM)
+            {
+                Serial.print(dsp_query(ADDR1(DSP_FM_LEVEL), ADDR2(DSP_FM_LEVEL), ADDR3(DSP_FM_LEVEL)), DEC);
+            }
+            else
+            {
+                Serial.print(dsp_query(ADDR1(DSP_AM_LEVEL), ADDR2(DSP_AM_LEVEL), ADDR3(DSP_AM_LEVEL)), DEC);
+            }
+            Serial.print(',');
         }
-        else
-        {
-            Serial.print(dsp_query(ADDR1(DSP_AM_LEVEL), ADDR2(DSP_AM_LEVEL), ADDR3(DSP_AM_LEVEL)), DEC);
-        }
-        Serial.print(',');
-        freq += step;
-    }
-    Serial.print('\n');
-    spectrum_flag = false;
+        Serial.print('\n');
+    } while(continous && !Serial.available());
+
+    scan_flag = false;
 
     // restore previous settings
+    dsp_set_filter(current_filter);
     CONTROL = _CONTROL;
     PLL = _PLL;
     DAA = _DAA;
     AGC = _AGC;
     BAND = _BAND;
     tune(true);
+    dsp_volume_scaler(volume); // unmute
 }
 
 void serial_hex(uint8_t val)
@@ -744,45 +830,13 @@ void zero()
     delayMicroseconds(600);
 }
 
-void align(uint32_t freq)
+void ant_switch(uint8_t n)
 {
-    // alignment of the antenna circuit
-    // these values are individual for each tuner!
-    if(freq>=107300)
-        DAA = 52;
-    else if(freq>=104500)
-        DAA = 53;
-    else if(freq>=100400)
-        DAA = 54;
-    else if(freq>=97500)
-        DAA = 55;
-    else if(freq>=95600)
-        DAA = 56;
-    else if(freq>=92900)
-        DAA = 57;
-    else if(freq>=90500)
-        DAA = 58;
-    else if(freq>=87800)
-        DAA = 59;
-    else if(freq>=87000)
-        DAA = 60;
-    else if(freq>=85000)
-        DAA = 61;
-    else if(freq>=84000)
-        DAA = 62;
-    else if(freq>=83000)
-        DAA = 63;
-    else if(freq>=78000)
-        DAA = 64;
-    else if(freq>=76000)
-        DAA = 65;
-    else if(freq>=74000)
-        DAA = 66;
-    else if(freq>=73000)
-        DAA = 67;
-    else if(freq>=70000)
-        DAA = 69;
-    else
-        DAA = 70;
+    if(n < ANT_n)
+    {
+        digitalWrite(ANT[current_ant], LOW);
+        current_ant = n;
+        digitalWrite(ANT[current_ant], HIGH);
+    }
 }
 
