@@ -1,6 +1,6 @@
 /*
- *  XDR-I2C 2013-11-12
- *  Copyright (C) 2012-2013  Konrad Kosmatka
+ *  XDR-I2C 2014-02-20
+ *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -14,7 +14,13 @@
  */
 
 #define IR 0
-/* If you have an IR diode, change this to 1 */
+/* If you have an IR diode for auto power-up, change this to 1 */
+
+#define POWER 0
+/* If you have a transistor for auto power-up, change this to 1 */
+
+#define SLEEP_TIME 6
+/* Delay between tuner power up and XDR-I2C start in seconds */
 
 #include <Arduino.h>
 #include <I2cMaster.h>
@@ -26,7 +32,8 @@
 // Pinout
 #define RDS_PIN    2
 #define IR_PIN     3
-#define RESET_PIN  4
+#define POWER_PIN  4
+#define RESET_PIN  5
 #define ANT_A_PIN  8
 #define ANT_B_PIN  9
 #define ANT_C_PIN 10
@@ -107,9 +114,12 @@ void setup(void)
     pinMode(RDS_PIN, INPUT);
     pinMode(SDA_PIN, INPUT);
     pinMode(SCL_PIN, INPUT);
+    pinMode(POWER_PIN, OUTPUT);
+    digitalWrite(POWER_PIN, LOW);
     pinMode(RESET_PIN, OUTPUT);
     digitalWrite(RESET_PIN, LOW);
     pinMode(IR_PIN, OUTPUT);
+    digitalWrite(IR_PIN, LOW);
     pinMode(ANT_A_PIN, OUTPUT);
     pinMode(ANT_B_PIN, OUTPUT);
     pinMode(ANT_C_PIN, OUTPUT);
@@ -140,10 +150,15 @@ void setup(void)
         sendcode(0xA8BC8);
         delayMicroseconds(10000);
     }
-    delay(5500);
+    delay(SLEEP_TIME*1000UL);
+#elif POWER
+    digitalWrite(IR_PIN, HIGH);
+    delay(200);
+    digitalWrite(IR_PIN, LOW);
+    delay(SLEEP_TIME*1000UL);
 #endif
 
-    digitalWrite(RESET_PIN, HIGH);
+    digitalWrite(POWER_PIN, HIGH);
     pinMode(SDA_PIN, OUTPUT);
     pinMode(SCL_PIN, OUTPUT);
     digitalWrite(SDA_PIN, HIGH);
@@ -151,6 +166,13 @@ void setup(void)
     delay(100);
 
 #if INIT
+    delay(500);
+    digitalWrite(RESET_PIN, HIGH);
+    delay(100);
+    digitalWrite(RESET_PIN, LOW);
+    delay(5);
+    digitalWrite(RESET_PIN, HIGH);
+    delay(100);
     dsp_write_data(DSP_INIT);
 #endif
 
@@ -348,7 +370,7 @@ void loop()
 
             case 'X': // shutdown
                 TWCR = 0; // release SDA and SCL lines used by hardware I2C
-                digitalWrite(RESET_PIN, LOW);
+                digitalWrite(POWER_PIN, LOW);
                 Serial.print("X\n");
                 delay(10);
                 asm("jmp 0");
@@ -537,6 +559,15 @@ void dsp_read_rds()
             pi_checked = true;
         }
         pi_pos = (pi_pos+1)%PI_BUFFER_SIZE;
+
+        if((status & B11111100) == 0x90)
+        {
+            // include the PI code for RDS Spy
+            rds_buffer[2] = buffer[0];
+            rds_buffer[3] = buffer[1];
+            rds_status_buffer &= B0011;
+            rds_status_buffer |= (status&B11) << 2;
+        }
         break;
     case 0x84: // block B
         // we will wait for block C & D before sending anything to the serial
