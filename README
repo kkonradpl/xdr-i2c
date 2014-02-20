@@ -1,15 +1,14 @@
 XDR-F1HD I2C Controller
 
 Author: Konrad Kosmatka
-  
+
 Thanks to (alphabetical order):
 - Brian Beezley
 - Olivier Guillaume
 - Przemysław Korpas
 - Marcin Wołoszczuk
 
-Tested with Seeeduino 3.3V
+Tested with Seeeduino at 3.3V
 
-Requires I2C library: (i2cv2.zip)
+Includes I2C library by William Greiman from:
 http://forums.adafruit.com/viewtopic.php?f=25&t=13722
-
