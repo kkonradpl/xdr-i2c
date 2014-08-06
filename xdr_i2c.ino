@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-02-20
+ *  XDR-I2C 2014-08-06
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -30,20 +30,32 @@
 #include "align.h"
 
 // Pinout
-#define RDS_PIN    2
-#define IR_PIN     3
-#define POWER_PIN  4
-#define RESET_PIN  5
-#define ANT_A_PIN  8
-#define ANT_B_PIN  9
-#define ANT_C_PIN 10
-#define ANT_D_PIN 11
-#define SDA_PIN   A4
-#define SCL_PIN   A5
+#define RDS_PIN     2
+#define IR_PIN      3
+#define POWER_PIN   4
+#define RESET_PIN   5
+#define ROT_CW_PIN  6
+#define ROT_CCW_PIN 7
+#define ANT_A_PIN   8
+#define ANT_B_PIN   9
+#define ANT_C_PIN  10
+#define ANT_D_PIN  11
+#define SDA_PIN    A4
+#define SCL_PIN    A5
+
+#define MODE_FM 0
+#define MODE_AM 1
+#define ROTATION_OFF 0
+#define ROTATION_CW  1
+#define ROTATION_CCW 2
+
+#ifndef M_E
+#define M_E 2.71828182845905
+#endif
 
 // Serial
 #define SERIAL_BUFFER_SIZE 16
-char buff[SERIAL_BUFFER_SIZE]; 
+char buff[SERIAL_BUFFER_SIZE];
 uint8_t buff_pos = 0;
 
 // TEF6730 IF
@@ -74,36 +86,51 @@ const uint8_t ANT[] = {ANT_A_PIN, ANT_B_PIN, ANT_C_PIN, ANT_D_PIN};
 const uint8_t ANT_n = sizeof(ANT)/sizeof(uint8_t);
 uint8_t current_ant = 0;
 
+// Signal level & squelch
+#define TIMER_INTERVAL 33
+#define SQUELCH_TIMEOUT 6
+uint32_t timer = 0;
+float prev_level = 0.0;
+bool print_level = false;
+uint8_t squelch_threshold = 0;
+uint8_t squelch_state = 0;
+
 // Other
-#define TIMER_INTERVAL 67
 #define INIT 0
-#define MODE_FM 0
-#define MODE_AM 1
-uint8_t mode; // AM/FM
-uint32_t timer = 0; // signal level reporting timer
+#define MAX_VOLUME 0x07FF
+#define ROTATOR_TIMEOUT 90
+uint8_t mode; // FM/AM demod
 int8_t current_filter = -1; // current FIR filter (-1 is adaptive)
-uint16_t volume = 0x07FF; // audio volume control
+uint8_t current_filter_flag = 0;
+uint16_t volume = MAX_VOLUME; // audio volume control
+uint32_t rotator_timer = 0;
 
 TwiMaster i2c(false);
 
 uint8_t dsp_query(uint8_t, uint8_t, uint8_t);
 void dsp_write_data(const uint8_t*);
 void dsp_write_coeff(uint8_t, uint8_t);
-void dsp_read_rds();
 void dsp_volume_scaler(uint16_t);
 void dsp_set_filter(int8_t);
 void dsp_set_deemphasis(uint8_t);
+void dsp_read_rds();
 void tune(boolean);
 bool tune_freq(uint32_t);
+void mode_FM();
+void mode_AM();
 void scan(bool);
+uint32_t get_current_freq();
+void ant_switch(uint8_t);
+float signal_level();
+void serial_signal(float);
 void serial_hex(uint8_t);
-void sendcode(uint32_t code);
-void carrier(int time);
+void serial_write_signal(float, uint8_t);
+
+void sendcode(uint32_t);
+void carrier(int);
 void start();
 void one();
 void zero();
-void ant_switch(uint8_t);
-void align(uint32_t);
 
 #define ADDR1(a) ((a & 0xFF0000) >> 16)
 #define ADDR2(a) ((a & 0xFF00) >> 8)
@@ -120,6 +147,11 @@ void setup(void)
     digitalWrite(RESET_PIN, LOW);
     pinMode(IR_PIN, OUTPUT);
     digitalWrite(IR_PIN, LOW);
+    pinMode(ROT_CW_PIN, OUTPUT);
+    pinMode(ROT_CCW_PIN, OUTPUT);
+    digitalWrite(ROT_CW_PIN, LOW);
+    digitalWrite(ROT_CCW_PIN, LOW);
+    pinMode(ANT_D_PIN, OUTPUT);
     pinMode(ANT_A_PIN, OUTPUT);
     pinMode(ANT_B_PIN, OUTPUT);
     pinMode(ANT_C_PIN, OUTPUT);
@@ -190,53 +222,78 @@ void setup(void)
 
 void loop()
 {
+    uint8_t i;
+
     if(!digitalRead(RDS_PIN))
     {
         dsp_read_rds();
     }
 
+    if(rotator_timer && (millis()-rotator_timer) >= ROTATOR_TIMEOUT*1000UL)
+    {
+        digitalWrite(ROT_CW_PIN, LOW);
+        digitalWrite(ROT_CCW_PIN, LOW);
+        rotator_timer = 0;
+        Serial.write("C0\n");
+    }
+
     // check signal level and 19kHz subcarrier every TIMER_INTERVAL
     if((millis()-timer) >= TIMER_INTERVAL)
     {
-        uint32_t buffer;
-        i2c.start(DSP_I2C | I2C_WRITE);
-        if(mode == MODE_FM)
-        {
-            i2c.write(ADDR1(DSP_FM_LEVEL));
-            i2c.write(ADDR2(DSP_FM_LEVEL));
-            i2c.write(ADDR3(DSP_FM_LEVEL));
-        }
-        else
-        {
-            i2c.write(ADDR1(DSP_AM_LEVEL));
-            i2c.write(ADDR2(DSP_AM_LEVEL));
-            i2c.write(ADDR3(DSP_AM_LEVEL));
-        }
-        i2c.restart(DSP_I2C | I2C_READ);
-        buffer = ((uint32_t)i2c.read(false) << 16);
-        buffer |= ((uint16_t)i2c.read(false) << 8);
-        buffer |= i2c.read(true);
-        i2c.stop();
-
-        Serial.print('S');
-        if(mode == MODE_FM && dsp_query(ADDR1(DSP_ST_19kHz), ADDR2(DSP_ST_19kHz), ADDR3(DSP_ST_19kHz)))
-        {
-            Serial.print('s'); // 19kHz subcarrier
-        }
-        else
-        {
-            Serial.print('m');
-        }
-        Serial.print(buffer, DEC);
-        Serial.print('\n');
         timer = millis();
+        float level = signal_level();
+
+        if(level > squelch_threshold && !squelch_state)
+        {
+            dsp_volume_scaler(volume);
+            squelch_state = SQUELCH_TIMEOUT;
+        }
+        else if(squelch_state)
+        {
+            if(level > squelch_threshold)
+            {
+                squelch_state = SQUELCH_TIMEOUT;
+            }
+            else
+            {
+                squelch_state--;
+                if(!squelch_state)
+                {
+                    dsp_volume_scaler(0);
+                }
+            }
+        }
+
+        if(print_level)
+        {
+            Serial.print('S');
+            if(mode == MODE_FM && dsp_query(ADDR1(DSP_ST_19kHz), ADDR2(DSP_ST_19kHz), ADDR3(DSP_ST_19kHz)))
+            {
+                Serial.print('s'); // 19kHz subcarrier
+            }
+            else
+            {
+                Serial.print('m');
+            }
+            serial_write_signal(((prev_level > 0) ? ((prev_level + level) / 2.0) : level), 2);
+            Serial.print('\n');
+        }
+        else
+        {
+            prev_level = level;
+        }
+
+        print_level = !print_level;
     }
+
 
     if(Serial.available() > 0)
     {
         buff[buff_pos] = Serial.read();
         if(buff[buff_pos] != '\n' && buff_pos != SERIAL_BUFFER_SIZE-1)
+        {
             buff_pos++;
+        }
         else
         {
             buff[buff_pos] = 0x00;
@@ -256,6 +313,7 @@ void loop()
                     Serial.print(get_current_freq(), DEC);
                     Serial.print('\n');
                 }
+                prev_level = 0.0;
                 break;
 
             case 'A': // RF AGC threshold
@@ -350,22 +408,52 @@ void loop()
                 {
                     if(buff[1] == 'm')
                     {
-                      scan(true); // multiple (continous) scan
+                        scan(true); // multiple (continous) scan
                     }
                     else
                     {
-                      scan(false); // single scan
+                        scan(false); // single scan
                     }
                 }
                 break;
 
             case 'Y': // audio volume scaler
-                volume = atoi(buff+1);
-                dsp_volume_scaler(volume);
+                volume = (exp(atoi(buff+1)/100.0)-1)/(M_E-1) * MAX_VOLUME;
+                if(squelch_state)
+                {
+                    dsp_volume_scaler(volume);
+                }
                 break;
 
-            case 'Z': // antenna switch  
+            case 'Z': // antenna switch
                 ant_switch(atoi(buff+1));
+                break;
+
+            case 'C': // antenna rotation
+                switch(atoi(buff+1))
+                {
+                case ROTATION_OFF:
+                    digitalWrite(ROT_CW_PIN, LOW);
+                    digitalWrite(ROT_CCW_PIN, LOW);
+                    rotator_timer = 0;
+                    break;
+
+                case ROTATION_CW:
+                    digitalWrite(ROT_CW_PIN, HIGH);
+                    digitalWrite(ROT_CCW_PIN, LOW);
+                    rotator_timer = millis();
+                    break;
+
+                case ROTATION_CCW:
+                    digitalWrite(ROT_CW_PIN, LOW);
+                    digitalWrite(ROT_CCW_PIN, HIGH);
+                    rotator_timer = millis();
+                    break;
+                }
+                break;
+
+            case 'Q': // squelch
+                squelch_threshold = atoi(buff+1);
                 break;
 
             case 'X': // shutdown
@@ -448,8 +536,12 @@ void dsp_set_filter(int8_t f)
             return;
         }
 
-        // write the FIR filter coefficients into $15 filter bank
-        dsp_write_coeff(15, f);
+        // use another filter bank to avoid audio 'popping'
+        // when changing bandwidth next to stronger adjacent station
+        current_filter_flag = (current_filter_flag?0:1);
+
+        // write the FIR filter coefficients into $15 or $14 filter bank
+        dsp_write_coeff(0x0F - current_filter_flag, f);
 
         i2c.start(DSP_I2C | I2C_WRITE);
         i2c.write(ADDR1(TDSP1_X_CIBW_1_FirCtlFix));
@@ -457,7 +549,7 @@ void dsp_set_filter(int8_t f)
         i2c.write(ADDR3(TDSP1_X_CIBW_1_FirCtlFix));
         i2c.write(0x00);
         i2c.write(0x00);
-        i2c.write(0x0F); // $15 filter
+        i2c.write(0x0F-current_filter_flag); // $15 or $14 filter
         i2c.stop();
 
         i2c.start(DSP_I2C | I2C_WRITE);
@@ -466,7 +558,7 @@ void dsp_set_filter(int8_t f)
         i2c.write(ADDR3(TDSP1_X_CIBW_4_FirCtlFix));
         i2c.write(0x00);
         i2c.write(0x00);
-        i2c.write(0x0F); // $15 filter
+        i2c.write(0x0F-current_filter_flag); // $15 or $14 filter
         i2c.stop();
 
         i2c.start(DSP_I2C | I2C_WRITE);
@@ -490,9 +582,6 @@ void dsp_set_filter(int8_t f)
     }
     else if(mode == MODE_FM) // adaptive filter bandwidth
     {
-        for(uint8_t i=0; i<16; i++)
-            dsp_write_coeff(i, adaptive_filters_set[i]);
-
         i2c.start(DSP_I2C | I2C_WRITE);
         i2c.write(ADDR1(TDSP1_X_CIBW_1_pFirCtl));
         i2c.write(ADDR2(TDSP1_X_CIBW_1_pFirCtl));
@@ -510,96 +599,9 @@ void dsp_set_filter(int8_t f)
         i2c.write(ADDR2(TDSP1_X_CIBW_4_FirCtl));
         i2c.write(ADDR3(TDSP1_X_CIBW_4_FirCtl));
         i2c.stop();
-    }
-}
 
-void dsp_read_rds()
-{
-    uint8_t buffer[2], status, current_pi_count = 0;
-    i2c.start(DSP_I2C | I2C_WRITE);
-    i2c.write(0x00);
-    i2c.write(0x00);
-    i2c.write(0x30);
-    i2c.restart(DSP_I2C | I2C_READ);
-    i2c.read(false);
-    status = i2c.read(true);
-    i2c.stop();
-
-    i2c.start(DSP_I2C | I2C_WRITE);
-    i2c.write(0x00);
-    i2c.write(0x00);
-    i2c.write(0x31);
-    i2c.restart(DSP_I2C | I2C_READ);
-    buffer[0] = i2c.read(false);
-    buffer[1] = i2c.read(true);
-    i2c.stop();
-    switch(status & B11111100)
-    {
-    case 0x00: // fast PI mode block
-    case 0x80: // block A
-    case 0x90: // block C'
-        pi_buffer[pi_pos] = ((buffer[0] << 8) | buffer[1]);
-        for(uint8_t i=0; i<PI_BUFFER_SIZE; i++)
-            if(pi_buffer[i]==pi_buffer[pi_pos])
-                current_pi_count++;
-
-        if(current_pi_count == 2 && !pi_checked)
-        {
-            Serial.print('P');
-            serial_hex(pi_buffer[pi_pos] >> 8);
-            serial_hex(pi_buffer[pi_pos] & 0xFF);
-            Serial.print("?\n");
-        }
-        else if(current_pi_count > 2)
-        {
-            Serial.print('P');
-            serial_hex(pi_buffer[pi_pos] >> 8);
-            serial_hex(pi_buffer[pi_pos] & 0xFF);
-            Serial.print('\n');
-            pi_checked = true;
-        }
-        pi_pos = (pi_pos+1)%PI_BUFFER_SIZE;
-
-        if((status & B11111100) == 0x90)
-        {
-            // include the PI code for RDS Spy
-            rds_buffer[2] = buffer[0];
-            rds_buffer[3] = buffer[1];
-            rds_status_buffer &= B0011;
-            rds_status_buffer |= (status&B11) << 2;
-        }
-        break;
-    case 0x84: // block B
-        // we will wait for block C & D before sending anything to the serial
-        rds_buffer[0] = buffer[0];
-        rds_buffer[1] = buffer[1];
-        rds_status_buffer = status&B11;
-        rds_status_buffer |= B111100;
-        rds_timer = millis();
-        break;
-    case 0x88: // block C
-        rds_buffer[2] = buffer[0];
-        rds_buffer[3] = buffer[1];
-        rds_status_buffer &= B0011;
-        rds_status_buffer |= (status&B11) << 2;
-        break;
-    case 0x8C: // block D
-        // is this block related to the block B from buffer?
-        if((millis()-rds_timer) < 50)
-        {
-            rds_status_buffer &= B001111;
-            rds_status_buffer |= (status&B11) << 4;
-            Serial.print('R');
-            serial_hex(rds_buffer[0]);
-            serial_hex(rds_buffer[1]);
-            serial_hex(rds_buffer[2]);
-            serial_hex(rds_buffer[3]);
-            serial_hex(buffer[0]);
-            serial_hex(buffer[1]);
-            serial_hex(rds_status_buffer);
-            Serial.print('\n');
-        }
-        break;
+        for(uint8_t i=0; i<16; i++)
+            dsp_write_coeff(i, adaptive_filters_set[i]);
     }
 }
 
@@ -609,7 +611,7 @@ void dsp_set_deemphasis(uint8_t d)
     {
         return;
     }
-    
+
     i2c.start(DSP_I2C | I2C_WRITE);
     i2c.write(ADDR1(DSP_DEEMPHASIS));
     i2c.write(ADDR2(DSP_DEEMPHASIS));
@@ -641,7 +643,88 @@ void dsp_set_deemphasis(uint8_t d)
         i2c.write(0x00);
         break;
     }
-    i2c.stop();  
+    i2c.stop();
+}
+
+void dsp_read_rds()
+{
+    uint8_t buffer[2], status, current_pi_count = 0;
+    i2c.start(DSP_I2C | I2C_WRITE);
+    i2c.write(0x00);
+    i2c.write(0x00);
+    i2c.write(0x30);
+    i2c.restart(DSP_I2C | I2C_READ);
+    i2c.read(false);
+    status = i2c.read(true);
+    i2c.stop();
+
+    i2c.start(DSP_I2C | I2C_WRITE);
+    i2c.write(0x00);
+    i2c.write(0x00);
+    i2c.write(0x31);
+    i2c.restart(DSP_I2C | I2C_READ);
+    buffer[0] = i2c.read(false);
+    buffer[1] = i2c.read(true);
+    i2c.stop();
+    switch(status & B11111100)
+    {
+    case 0x00: // fast PI mode block
+    case 0x80: // block A
+        pi_buffer[pi_pos] = ((buffer[0] << 8) | buffer[1]);
+        for(uint8_t i=0; i<PI_BUFFER_SIZE; i++)
+            if(pi_buffer[i]==pi_buffer[pi_pos])
+                current_pi_count++;
+
+        if(current_pi_count == 2 && !pi_checked)
+        {
+            Serial.print('P');
+            serial_hex(pi_buffer[pi_pos] >> 8);
+            serial_hex(pi_buffer[pi_pos] & 0xFF);
+            Serial.print("?\n");
+        }
+        else if(current_pi_count > 2)
+        {
+            Serial.print('P');
+            serial_hex(pi_buffer[pi_pos] >> 8);
+            serial_hex(pi_buffer[pi_pos] & 0xFF);
+            Serial.print('\n');
+            pi_checked = true;
+        }
+        pi_pos = (pi_pos+1)%PI_BUFFER_SIZE;
+        break;
+    case 0x84: // block B
+        // we will wait for block C & D before sending anything to the serial
+        rds_buffer[0] = buffer[0];
+        rds_buffer[1] = buffer[1];
+        rds_status_buffer = status&B11;
+        rds_status_buffer |= B111100;
+        rds_timer = millis();
+        break;
+    case 0x88: // block C
+    case 0x90: // block C'
+        rds_buffer[2] = buffer[0];
+        rds_buffer[3] = buffer[1];
+        rds_status_buffer &= B0011;
+        rds_status_buffer |= (status&B11) << 2;
+        break;
+    case 0x8C: // block D
+        // is this block related to the block B from buffer?
+        if((millis()-rds_timer) < 50)
+        {
+            rds_status_buffer &= B001111;
+            rds_status_buffer |= (status&B11) << 4;
+            Serial.print('R');
+            serial_hex(rds_buffer[0]);
+            serial_hex(rds_buffer[1]);
+            serial_hex(rds_buffer[2]);
+            serial_hex(rds_buffer[3]);
+            serial_hex(buffer[0]);
+            serial_hex(buffer[1]);
+            serial_hex(rds_status_buffer);
+            Serial.print('\n');
+        }
+        break;
+    }
 }
 
 void tune(boolean reset_rds_sync)
@@ -747,7 +830,7 @@ void scan(bool continous)
     uint8_t _AGC = AGC;
     uint8_t _BAND = BAND; // save current settings
     uint32_t freq;
-    
+
     scan_flag = true;
     dsp_volume_scaler(0); // mute
     dsp_set_filter(scan_filter);
@@ -760,18 +843,12 @@ void scan(bool continous)
             tune_freq(freq);
             Serial.print(get_current_freq(), DEC);
             Serial.print('=');
-            if(mode == MODE_FM)
-            {
-                Serial.print(dsp_query(ADDR1(DSP_FM_LEVEL), ADDR2(DSP_FM_LEVEL), ADDR3(DSP_FM_LEVEL)), DEC);
-            }
-            else
-            {
-                Serial.print(dsp_query(ADDR1(DSP_AM_LEVEL), ADDR2(DSP_AM_LEVEL), ADDR3(DSP_AM_LEVEL)), DEC);
-            }
+            serial_write_signal(signal_level(), 1);
             Serial.print(',');
         }
         Serial.print('\n');
-    } while(continous && !Serial.available());
+    }
+    while(continous && !Serial.available());
 
     scan_flag = false;
 
@@ -784,12 +861,6 @@ void scan(bool continous)
     BAND = _BAND;
     tune(true);
     dsp_volume_scaler(volume); // unmute
-}
-
-void serial_hex(uint8_t val)
-{
-    Serial.print(val >> 4 & 0xF, HEX);
-    Serial.print(val & 0xF, HEX);
 }
 
 uint32_t get_current_freq()
@@ -810,6 +881,63 @@ uint32_t get_current_freq()
         return 10*(uint32_t)PLL/6-10700;
     else
         return 0;
+}
+
+void ant_switch(uint8_t n)
+{
+    if(n < ANT_n)
+    {
+        digitalWrite(ANT[current_ant], LOW);
+        current_ant = n;
+        digitalWrite(ANT[current_ant], HIGH);
+    }
+}
+
+float signal_level()
+{
+    float buffer;
+    i2c.start(DSP_I2C | I2C_WRITE);
+    if(mode == MODE_FM)
+    {
+        i2c.write(ADDR1(DSP_FM_LEVEL));
+        i2c.write(ADDR2(DSP_FM_LEVEL));
+        i2c.write(ADDR3(DSP_FM_LEVEL));
+    }
+    else
+    {
+        i2c.write(ADDR1(DSP_AM_LEVEL));
+        i2c.write(ADDR2(DSP_AM_LEVEL));
+        i2c.write(ADDR3(DSP_AM_LEVEL));
+    }
+    i2c.restart(DSP_I2C | I2C_READ);
+    buffer = i2c.read(false);
+    buffer += (uint16_t)((i2c.read(false) << 8) | i2c.read(true)) / 65536.0;
+    i2c.stop();
+
+    if(mode == MODE_FM)
+    {
+        buffer = buffer * 0.797 + 3.5;
+    }
+    return buffer;
+}
+
+void serial_hex(uint8_t val)
+{
+    Serial.print(val >> 4 & 0xF, HEX);
+    Serial.print(val & 0xF, HEX);
+}
+
+void serial_write_signal(float level, uint8_t precision)
+{
+    uint8_t n = (level-(int)level)*pow(10, precision);
+
+    Serial.print((int)level, DEC);
+    Serial.write('.');
+    if(precision == 2 && n < 10)
+    {
+        Serial.write('0');
+    }
+    Serial.print(n, DEC);
 }
 
 /* IR support by F4CMB */
@@ -860,14 +988,3 @@ void zero()
     carrier(600);
     delayMicroseconds(600);
 }
-
-void ant_switch(uint8_t n)
-{
-    if(n < ANT_n)
-    {
-        digitalWrite(ANT[current_ant], LOW);
-        current_ant = n;
-        digitalWrite(ANT[current_ant], HIGH);
-    }
-}
-
