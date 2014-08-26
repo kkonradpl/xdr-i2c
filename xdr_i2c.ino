@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-08-22
+ *  XDR-I2C 2014-08-25
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -91,6 +91,7 @@ uint8_t current_ant = 0;
 #define SQUELCH_TIMEOUT 6
 uint32_t timer = 0;
 float prev_level = 0.0;
+bool prev_stereo = false;
 bool print_level = false;
 int8_t squelch_threshold = 0;
 uint8_t squelch_state = 0;
@@ -98,6 +99,7 @@ uint8_t squelch_state = 0;
 // Other
 #define INIT 0
 #define MAX_VOLUME 0x07FF
+#define ST_THRESHOLD 0x052
 #define ROTATOR_TIMEOUT 90
 uint8_t mode; // FM/AM demod
 int8_t current_filter = -1; // current FIR filter (-1 is adaptive)
@@ -126,6 +128,8 @@ float signal_level();
 void serial_signal(float);
 void serial_hex(uint8_t);
 void serial_write_signal(float, uint8_t);
+void st_pilot();
+bool st_pilot_test(uint8_t level);
 
 void sendcode(uint32_t);
 void carrier(int);
@@ -213,6 +217,7 @@ void setup(void)
     dsp_write_16(DSP_VOLUME_SCALER, volume); // set max sound volume
     dsp_set_deemphasis(0); // 50us de-emphasis as default
     tune_freq(87500); // tune to 87.500 MHz
+    dsp_write_16(DSP_ST_THRESHOLD, ST_THRESHOLD); // 3.75kHz stereo pilot threshold
 
     while(Serial.available() > 0)
     {
@@ -272,18 +277,18 @@ void loop()
         if(print_level)
         {
             Serial.print('S');
-            Serial.print((stereo?'s':'m'));
+            Serial.print((prev_stereo||stereo)?'s':'m');
             serial_write_signal(((prev_level > 0) ? ((prev_level + level) / 2.0) : level), 2);
             Serial.print('\n');
         }
         else
         {
             prev_level = level;
+            prev_stereo = stereo;
         }
 
         print_level = !print_level;
     }
-
 
     if(Serial.available() > 0)
     {
@@ -312,6 +317,7 @@ void loop()
                     Serial.print('\n');
                 }
                 prev_level = 0.0;
+                prev_stereo = false;
                 break;
 
             case 'A': // RF AGC threshold
@@ -452,6 +458,10 @@ void loop()
 
             case 'Q': // squelch
                 squelch_threshold = atol(buff+1);
+                break;
+                
+            case 'N':
+                st_pilot();
                 break;
 
             case 'X': // shutdown
@@ -885,6 +895,45 @@ void serial_write_signal(float level, uint8_t precision)
         Serial.write('0');
     }
     Serial.print(n, DEC);
+}
+
+void st_pilot()
+{
+    uint8_t i, j, level = 0;
+    // if the subcarrier is present (>3kHz), try to guess the level
+    if(st_pilot_test(30))
+    {
+        // check from 15kHz to 3kHz in 1kHz step
+        for(i=150; i>30; i-=10)
+        {
+            if(st_pilot_test(i))
+            {
+                level = i;
+                // the stereo subcarrier is found
+                // find the exact value
+                for(j=i+10; j>i; j--)
+                {
+                    if(st_pilot_test(j))
+                    {
+                        level = j;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    dsp_write_16(DSP_ST_THRESHOLD, ST_THRESHOLD);
+    Serial.write('N');
+    Serial.print(level, DEC);
+    Serial.write('\n');
+}
+
+bool st_pilot_test(uint8_t level)
+{
+    dsp_write_16(DSP_ST_THRESHOLD, (uint16_t)((1.08 * ((level-1)/10.0)) / 100.0 * 2048));
+    delay(2);
+    return dsp_read_16(DSP_ST_19kHz);
 }
 
 /* IR support by F4CMB */
