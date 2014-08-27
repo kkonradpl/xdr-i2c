@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-08-25
+ *  XDR-I2C 2014-08-27
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -128,6 +128,7 @@ float signal_level();
 void serial_signal(float);
 void serial_hex(uint8_t);
 void serial_write_signal(float, uint8_t);
+void signal_reset();
 void st_pilot();
 bool st_pilot_test(uint8_t level);
 
@@ -316,8 +317,6 @@ void loop()
                     Serial.print(get_current_freq(), DEC);
                     Serial.print('\n');
                 }
-                prev_level = 0.0;
-                prev_stereo = false;
                 break;
 
             case 'A': // RF AGC threshold
@@ -711,6 +710,8 @@ void tune(boolean reset_rds_sync)
         dsp_write_16(0x000035, 0x0060); // fast pi mode
         pi_checked = false;
     }
+
+    signal_reset();
     delay(4);
 }
 
@@ -847,6 +848,7 @@ void ant_switch(uint8_t n)
         digitalWrite(ANT[current_ant], LOW);
         current_ant = n;
         digitalWrite(ANT[current_ant], HIGH);
+        signal_reset();
     }
 }
 
@@ -895,6 +897,12 @@ void serial_write_signal(float level, uint8_t precision)
         Serial.write('0');
     }
     Serial.print(n, DEC);
+}
+
+void signal_reset()
+{
+    prev_level = 0.0;
+    prev_stereo = false;
 }
 
 void st_pilot()
