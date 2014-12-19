@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-08-27
+ *  XDR-I2C 2014-12-19
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -12,24 +12,35 @@
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
  */
-
-#define IR 0
-/* If you have an IR diode for auto power-up, change this to 1 */
-
-#define POWER 0
-/* If you have a transistor for auto power-up, change this to 1 */
-
-#define SLEEP_TIME 6
-/* Delay between tuner power up and XDR-I2C start in seconds */
-
 #include <Arduino.h>
-#include "I2cMaster.h"
 #include <avr/pgmspace.h>
+#include "I2cMaster.h"
 #include "xdr_f1hd.h"
 #include "filters.h"
 #include "align.h"
 
-// Pinout
+/* If you have an IR diode for auto power-up, change this to 1 */
+#define IR 0
+
+/* If you have a transistor for auto power-up, change this to 1 */
+#define POWER 0
+
+/* Delay between tuner power up and XDR-I2C start in seconds */
+#define SLEEP_TIME 6
+
+/* Delay after antenna switch in miliseconds */
+#define ANTENNA_SWITCH_DELAY 50
+
+/* Automatic rotator stop after specified time in seconds */
+#define ROTATOR_TIMEOUT 90
+
+/* Maximum audio output level (0~2047) */
+#define MAX_VOLUME 2047
+
+/* Send DSP initialization data on start (for tuners without stock controller) */
+#define INIT 0
+
+/* Pinout */
 #define RDS_PIN     2
 #define IR_PIN      3
 #define POWER_PIN   4
@@ -87,8 +98,8 @@ const uint8_t ANT_n = sizeof(ANT)/sizeof(uint8_t);
 uint8_t current_ant = 0;
 
 // Signal level & squelch
-#define TIMER_INTERVAL 33
-#define SQUELCH_TIMEOUT 6
+#define TIMER_INTERVAL   33
+#define SQUELCH_TIMEOUT   6
 uint32_t timer = 0;
 float prev_level = 0.0;
 bool prev_stereo = false;
@@ -97,10 +108,7 @@ int8_t squelch_threshold = 0;
 uint8_t squelch_state = 0;
 
 // Other
-#define INIT 0
-#define MAX_VOLUME 0x07FF
 #define ST_THRESHOLD 0x052
-#define ROTATOR_TIMEOUT 90
 uint8_t mode; // FM/AM demod
 int8_t current_filter = -1; // current FIR filter (-1 is adaptive)
 uint8_t current_filter_flag = 0;
@@ -129,6 +137,7 @@ void serial_signal(float);
 void serial_hex(uint8_t);
 void serial_write_signal(float, uint8_t);
 void signal_reset();
+void rds_sync_reset();
 void st_pilot();
 bool st_pilot_test(uint8_t level);
 
@@ -707,8 +716,7 @@ void tune(boolean reset_rds_sync)
 
     if(reset_rds_sync && !scan_flag)
     {
-        dsp_write_16(0x000035, 0x0060); // fast pi mode
-        pi_checked = false;
+        rds_sync_reset();
     }
 
     signal_reset();
@@ -818,7 +826,10 @@ void scan(bool continous)
     AGC = _AGC;
     BAND = _BAND;
     tune(true);
-    dsp_write_16(DSP_VOLUME_SCALER, volume); // unmute
+    if(squelch_state)
+    {
+        dsp_write_16(DSP_VOLUME_SCALER, volume); // unmute
+    }
 }
 
 uint32_t get_current_freq()
@@ -849,6 +860,8 @@ void ant_switch(uint8_t n)
         current_ant = n;
         digitalWrite(ANT[current_ant], HIGH);
         signal_reset();
+        delay(ANTENNA_SWITCH_DELAY);
+        rds_sync_reset();
     }
 }
 
@@ -903,6 +916,12 @@ void signal_reset()
 {
     prev_level = 0.0;
     prev_stereo = false;
+}
+
+void rds_sync_reset()
+{
+    dsp_write_16(0x000035, 0x0060); // fast pi mode
+    pi_checked = false;
 }
 
 void st_pilot()
