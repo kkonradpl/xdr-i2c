@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-12-19
+ *  XDR-I2C 2014-12-28
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -190,6 +190,15 @@ void setup(void)
             }
         }
     }
+
+#if IR || POWER
+    /* Reset the tuner before trying to power it up
+       It might be already running! */
+    digitalWrite(POWER_PIN, HIGH);
+    delay(200);
+    digitalWrite(POWER_PIN, LOW);
+    delay(2500);
+#endif
 
 #if IR
     for(uint8_t i=0; i<10; i++)
