@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2014-12-28
+ *  XDR-I2C 2014-12-31
  *  Copyright (C) 2012-2014  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -27,6 +27,9 @@
 
 /* Delay between tuner power up and XDR-I2C start in seconds */
 #define SLEEP_TIME 6
+
+/* Reset tuner before trying to power it up (for IR/POWER) */
+#define IR_POWER_RESET 0
 
 /* Delay after antenna switch in miliseconds */
 #define ANTENNA_SWITCH_DELAY 50
@@ -191,7 +194,7 @@ void setup(void)
         }
     }
 
-#if IR || POWER
+#if IR_POWER_RESET && (IR || POWER)
     /* Reset the tuner before trying to power it up
        It might be already running! */
     digitalWrite(POWER_PIN, HIGH);
