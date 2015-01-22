@@ -1,6 +1,6 @@
 /*
- *  XDR-I2C 2014-12-31
- *  Copyright (C) 2012-2014  Konrad Kosmatka
+ *  XDR-I2C 2015-01-22
+ *  Copyright (C) 2012-2015  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -32,7 +32,7 @@
 #define IR_POWER_RESET 0
 
 /* Delay after antenna switch in miliseconds */
-#define ANTENNA_SWITCH_DELAY 50
+#define ANTENNA_SWITCH_DELAY 30
 
 /* Automatic rotator stop after specified time in seconds */
 #define ROTATOR_TIMEOUT 90
@@ -725,14 +725,14 @@ void tune(boolean reset_rds_sync)
     i2c.write(AGC);
     i2c.write(BAND);
     i2c.stop();
-
+    delay(4);
+    
     if(reset_rds_sync && !scan_flag)
     {
         rds_sync_reset();
     }
 
     signal_reset();
-    delay(4);
 }
 
 bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
@@ -874,6 +874,7 @@ void ant_switch(uint8_t n)
         signal_reset();
         delay(ANTENNA_SWITCH_DELAY);
         rds_sync_reset();
+        Serial.print("z\n");
     }
 }
 
