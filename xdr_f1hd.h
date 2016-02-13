@@ -3,7 +3,12 @@
 #define DSP_I2C                  0x38
 #define IF_I2C                   0xC4
 
-#define DSP_FM_LEVEL             0x030092
+#define DSP_RDS_STATUS           0x000030
+#define DSP_RDS_DATA             0x000031
+#define DSP_RDS_CONTROL          0x000035
+
+#define DSP_FM_LEVEL_FAST        0x030092
+#define DSP_FM_LEVEL             0x030097
 #define DSP_AM_LEVEL             0x03006E
 #define DSP_VOLUME_SCALER        0x031011
 #define DSP_ST_19kHz             0x03102C
