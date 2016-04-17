@@ -72,6 +72,8 @@ const uint8_t* const filters[] =
     NFM // 31
 };
 
+const uint8_t filters_count = sizeof(filters)/sizeof(uint8_t);
+
 uint8_t adaptive_filters_set[] =
 {
     0, 26, 1, 28, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13

@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2016-02-13
+ *  XDR-I2C 2016-04-17
  *  Copyright (C) 2012-2016  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -36,6 +36,9 @@
 
 /* Automatic rotator stop after specified time in seconds */
 #define ROTATOR_TIMEOUT 90
+
+/* Rotator delay between direction change in miliseconds */
+#define ROTATOR_DELAY 1000
 
 /* Maximum audio output level (0~2047) */
 #define MAX_VOLUME 2047
@@ -104,10 +107,11 @@ uint8_t current_ant = 0;
 #define BUTTON_DEBOUNCE 50
 #define ST_THRESHOLD 0x052
 uint8_t mode;
+uint32_t current_freq = 87500;
 int8_t current_filter = -1; // current FIR filter (-1 is adaptive)
 uint16_t volume = MAX_VOLUME; // audio volume control
-uint32_t rotator_timer = 0;
-uint32_t current_freq = 87500;
+bool forced_mono = false;
+int8_t rotator_req = -1;
 
 #define MODE_FM 0
 #define MODE_AM 1
@@ -134,7 +138,7 @@ uint32_t current_freq = 87500;
 void setup();
 void loop();
 inline void handle_rds_interrupt();
-inline void handle_rotator_timeout();
+inline void handle_rotator();
 inline void handle_signal_check();
 inline void handle_serial_command();
 inline void handle_hw_button();
@@ -144,19 +148,23 @@ void dsp_write_24(uint32_t, uint32_t);
 void dsp_write_16(uint32_t, uint16_t);
 void dsp_write_data(const uint8_t*);
 void dsp_write_coeff(uint8_t, uint8_t);
-void dsp_set_filter(int8_t);
+bool dsp_set_filter(int8_t);
 void dsp_set_deemphasis(uint8_t);
 void dsp_read_rds();
 float dsp_read_signal(uint8_t);
+int8_t dsp_read_multipath(uint8_t);
+int8_t dsp_read_usn();
 
 void tune(uint8_t);
 bool tune_freq(uint32_t);
 void tune_full(uint32_t);
 uint32_t get_current_freq();
 
-void set_mode(uint8_t);
 void scan(bool);
-void ant_switch(uint8_t);
+
+bool set_mode(uint8_t);
+void set_agc(uint8_t);
+void set_antenna(uint8_t);
 
 void serial_hex(uint8_t);
 void serial_signal(float, uint8_t);
@@ -205,7 +213,8 @@ void setup()
     pinMode(ANT_D_PIN, OUTPUT);
     digitalWrite(ANT_D_PIN, LOW);
     digitalWrite(ANT[current_ant], HIGH);
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(BUTTON_PIN, INPUT);
+    digitalWrite(BUTTON_PIN, HIGH);
 
     Serial.begin(SERIAL_PORT_SPEED);
     while(true)
@@ -275,7 +284,7 @@ void loop()
 {
     handle_rds_interrupt();
     handle_hw_button();
-    handle_rotator_timeout();
+    handle_rotator();
     handle_signal_check();
     handle_serial_command();
 }
@@ -306,16 +315,63 @@ inline void handle_hw_button()
     last_state = current;
 }
 
-inline void handle_rotator_timeout()
+inline void handle_rotator()
 {
-    if(rotator_timer &&
-       (millis()-rotator_timer) >= ROTATOR_TIMEOUT*1000UL)
+    static int8_t state = ROTATION_OFF;
+    static int8_t last_state = ROTATION_OFF;
+    static int8_t queued = -1;
+    static uint32_t timer;
+
+    /* Request rotator stop automatically after a specified time */
+    if(state && (millis()-timer) >= ROTATOR_TIMEOUT*1000UL)
+        rotator_req = 0;
+
+    /* Nothing to do? */
+    if(rotator_req == -1)
+        return;
+
+    /* Stop the rotator */
+    if(state != ROTATION_OFF)
     {
         digitalWrite(ROT_CW_PIN, LOW);
         digitalWrite(ROT_CCW_PIN, LOW);
-        rotator_timer = 0;
-        Serial.write("C0\n");
+        timer = millis();
+        last_state = state;
+        state = ROTATION_OFF;
     }
+
+    /* Only stop? */
+    if(rotator_req == ROTATION_OFF)
+        goto rotator_new_state;
+
+    /* Wait before changing a rotation direction */
+    if(((last_state == ROTATION_CW && rotator_req == ROTATION_CCW) ||
+        (last_state == ROTATION_CCW && rotator_req == ROTATION_CW)) &&
+       (millis()-timer) < ROTATOR_DELAY)
+    {
+        if(queued != rotator_req)
+        {
+            Serial.print("C-");
+            Serial.print(rotator_req, DEC);
+            Serial.print('\n');
+            queued = rotator_req;
+        }
+        return; 
+    }
+    
+    if(rotator_req == ROTATION_CW)
+        digitalWrite(ROT_CW_PIN, HIGH);
+    else
+        digitalWrite(ROT_CCW_PIN, HIGH);
+    timer = millis();
+
+rotator_new_state:
+    Serial.print('C');
+    Serial.print(rotator_req, DEC);
+    Serial.print('\n');
+    state = rotator_req;
+    rotator_req = -1;
+    queued = -1;
 }
 
 inline void handle_signal_check()
@@ -326,7 +382,7 @@ inline void handle_signal_check()
     uint8_t curr_pos = (prev_pos+1)%SIGNAL_SAMPLE_COUNT;
     bool current_stereo;
     bool threshold_exceeded;
-    float print_level;
+    float current_level;
 
     /* Sample the signal level and ST subcarrier state
      * every TIMER_INTERVAL/SIGNAL_SAMPLE_COUNT. */
@@ -337,13 +393,13 @@ inline void handle_signal_check()
     level[curr_pos] = dsp_read_signal(level_fast_countdown ? LEVEL_FAST : LEVEL_SLOW);
     if(level_fast_countdown > 0)
         level_fast_countdown--;
-     
+
     stereo[curr_pos] = (mode == MODE_FM && dsp_read_16(DSP_ST_19kHz));
     /* At least 2/3 samples of stereo pilot detector should be positive */
     current_stereo = ((stereo[0] && stereo[1]) ||
                       (stereo[1] && stereo[2]) ||
                       (stereo[0] && stereo[2]));
-  
+
     /* Mute or unmute audio depending on a squelch (-1 is stereo, otherwise signal) */
     threshold_exceeded = ((squelch_threshold < 0) ? current_stereo : (level[curr_pos] >= squelch_threshold));
     if(threshold_exceeded && !squelch_state)
@@ -367,13 +423,20 @@ inline void handle_signal_check()
     if(!curr_pos)
     {
         if(level[0] >= 0.0 && level[1] >= 0.0 && level[2] >= 0.0)
-            print_level = (level[0] + level[1] + level[2]) / 3.0;
+            current_level = (level[0] + level[1] + level[2]) / 3.0;
         else
-            print_level = ((level[prev_pos] >= 0.0) ? ((level[prev_pos] + level[curr_pos]) / 2.0) : level[curr_pos]);
+            current_level = ((level[prev_pos] >= 0.0) ? ((level[prev_pos] + level[curr_pos]) / 2.0) : level[curr_pos]);
 
         Serial.print('S');
-        Serial.print((current_stereo)?'s':'m');
-        serial_signal(print_level, 2);
+        if(!forced_mono)
+            Serial.print((current_stereo)?'s':'m');
+        else
+            Serial.print((current_stereo)?'S':'M');
+        serial_signal(current_level, 2);
+        Serial.print(',');
+        Serial.print(dsp_read_multipath(current_level), DEC);
+        Serial.print(',');
+        Serial.print(dsp_read_usn(), DEC);
         Serial.print('\n');
     }
 
@@ -385,6 +448,7 @@ inline void handle_serial_command()
 {
     static char buff[SERIAL_BUFFER_SIZE];
     static uint8_t buff_pos = 0;
+    uint8_t n;
 
     if(!Serial.available())
         return;
@@ -413,55 +477,79 @@ inline void handle_serial_command()
         break;
 
     case 'A':
-        switch(atol(buff+1))
+        n = atol(buff+1);
+        if(n < 4)
         {
-        case 0: /* highest */
-            AGC &= B11110011;
-            break;
-        case 1: /* high */
-            AGC &= B11110111;
-            AGC |= B00000100;
-            break;
-        case 2: /* medium */
-            AGC &= B11111011;
-            AGC |= B00001000;
-            break;
-        case 3: /* low */
-            AGC |= B00001100;
-            break;
+            set_agc(n);
+            Serial.print('A');
+            Serial.print(n, DEC);
+            Serial.print('\n');
         }
-        tune(RESET_NONE);
         break;
 
     case 'V':
         DAA = atol(buff+1) & 0x7F;
         tune(RESET_NONE);
+        Serial.print('V');
+        Serial.print(DAA, DEC);
+        Serial.print('\n');
         break;
 
     case 'F':
-        current_filter = atol(buff+1);
-        dsp_set_filter(current_filter);
+        if(dsp_set_filter(atol(buff+1)))
+        {
+            current_filter = atol(buff+1);
+            Serial.print('F');
+            Serial.print(current_filter, DEC);
+            Serial.print('\n');
+        }
         break;
 
     case 'D':
-        dsp_set_deemphasis(atol(buff+1));
+        n = atol(buff+1);
+        if(n < 3)
+        {
+            dsp_set_deemphasis(n);
+            Serial.print('D');
+            Serial.print(n, DEC);
+            Serial.print('\n');
+        }
         break;
 
     case 'M':
-        set_mode(atol(buff+1));
-        tune(RESET_SIGNAL | RESET_RDS);
+        n = atol(buff+1);
+        if(set_mode(n))
+        {
+            tune(RESET_SIGNAL | RESET_RDS);
+            Serial.print('M');
+            Serial.print(n, DEC);
+            Serial.print('\n');
+        }
         break;
 
     case 'G':
+        Serial.print('G');
         if(buff[1] == '1')
+        {
             CONTROL |= B10000000; /* FM RF +6dB gain */
+            Serial.print('1');
+        }
         else
+        {
             CONTROL &= B01111111; /* FM RF standard gain */
-
+            Serial.print('0');
+        }
         if(buff[2] == '1')
+        {
             CONTROL |= B00010000; /* IF +6dB gain */
+            Serial.print('1');
+        }
         else
+        {
             CONTROL &= B11101111; /* IF standard gain */
+            Serial.print('0');
+        }
+        Serial.print('\n');
         tune(RESET_NONE);
         break;
 
@@ -479,42 +567,42 @@ inline void handle_serial_command()
         break;
 
     case 'Y':
-        volume = (uint16_t)((exp(atol(buff+1)/100.0)-1)/(M_E-1) * MAX_VOLUME);
-        if(squelch_state)
-            dsp_write_16(DSP_VOLUME_SCALER, volume);
-        break;
-
-    case 'Z':
-        ant_switch(atol(buff+1));
-        break;
-
-    case 'C':
-        switch(atol(buff+1))
+        n = atol(buff+1);
+        if(n <= 100)
         {
-        case ROTATION_OFF:
-            digitalWrite(ROT_CW_PIN, LOW);
-            digitalWrite(ROT_CCW_PIN, LOW);
-            rotator_timer = 0;
-            break;
-        case ROTATION_CW:
-            digitalWrite(ROT_CCW_PIN, LOW);
-            digitalWrite(ROT_CW_PIN, HIGH);
-            rotator_timer = millis();
-            break;
-        case ROTATION_CCW:
-            digitalWrite(ROT_CW_PIN, LOW);
-            digitalWrite(ROT_CCW_PIN, HIGH);
-            rotator_timer = millis();
-            break;
+            volume = (uint16_t)((exp(n/100.0)-1)/(M_E-1) * MAX_VOLUME);
+            if(squelch_state)
+                dsp_write_16(DSP_VOLUME_SCALER, volume);
+            Serial.print('Y');
+            Serial.print(n, DEC);
+            Serial.print('\n');
         }
         break;
 
     case 'Q':
         squelch_threshold = atol(buff+1);
+        Serial.print('Q');
+        Serial.print(squelch_threshold, DEC);
+        Serial.print('\n');
+        break;
+
+    case 'Z':
+        set_antenna(atol(buff+1));
+        break;
+
+    case 'C':
+        n = atol(buff+1);
+        if(n <= ROTATION_CCW)
+            rotator_req = n;
         break;
 
     case 'N':
         st_pilot();
+        break;
+
+    case 'B':
+        forced_mono = atol(buff+1);
+        dsp_write_16(DSP_FORCE_MONO, (forced_mono ? DSP_TRUE : DSP_FALSE));
         break;
 
     case 'X':
@@ -597,19 +685,19 @@ void dsp_write_coeff(uint8_t bank, uint8_t filter)
     }
 }
 
-void dsp_set_filter(int8_t f)
+bool dsp_set_filter(int8_t f)
 {
     static uint8_t current_filter_flag = 0;
     uint8_t i;
 
-    if(f >= 0)
+    if(f >= 0 && f < filters_count)
     {
         /* fixed filter bandwidth */
         if(mode == MODE_AM) /* workaround for AM (?) */
         {
             for(i=0; i<16; i++)
                 dsp_write_coeff(i, f);
-            return;
+            return true;
         }
 
         /* use another filter bank to avoid audio 'popping'
@@ -622,28 +710,29 @@ void dsp_set_filter(int8_t f)
         dsp_write_24(TDSP1_X_CIBW_4_FirCtlFix, 0x00000F-current_filter_flag); /* $15 or $14 filter */
         dsp_write_24(TDSP1_X_CIBW_1_pFirCtl, (uint16_t)TDSP1_X_CIBW_1_FirCtlFix); /* relative address */
         dsp_write_24(TDSP1_X_CIBW_4_pFirCtl, (uint16_t)TDSP1_X_CIBW_4_FirCtlFix); /* relative address */
+        return true;
     }
-    else if(mode == MODE_FM)
+    else if(mode == MODE_FM && f == -1)
     {
         /* adaptive filter bandwidth */
         dsp_write_24(TDSP1_X_CIBW_1_pFirCtl, (uint16_t)TDSP1_X_CIBW_1_FirCtl); /* relative address */
         dsp_write_24(TDSP1_X_CIBW_4_pFirCtl, (uint16_t)TDSP1_X_CIBW_4_FirCtl); /* relative address */
         for(i=0; i<16; i++)
             dsp_write_coeff(i, adaptive_filters_set[i]);
+        return true;
     }
+    return false;
 }
 
 void dsp_set_deemphasis(uint8_t d)
 {
-    if(d >= 3)
-        return;
-
     i2c.start(DSP_I2C | I2C_WRITE);
     i2c.write(ADDR1(DSP_DEEMPHASIS));
     i2c.write(ADDR2(DSP_DEEMPHASIS));
     i2c.write(ADDR3(DSP_DEEMPHASIS));
-    switch (d)
+    switch(d)
     {
+    default:
     case 0: /* 50us */
         i2c.write(0x02);
         i2c.write(0xC0);
@@ -780,6 +869,72 @@ float dsp_read_signal(uint8_t type)
     return buffer;
 }
 
+int8_t dsp_read_multipath(uint8_t level)
+{
+    uint32_t multipath_min, multipath_max, output;
+    if(mode != MODE_FM)
+        return -1;
+
+    /*  Unfortunately, the multipath detector slighly changes
+     *  its output depending on a current signal level. To
+     *  overcome this and provide a relative output that
+     *  always starts at 0%, a linear correction of usable
+     *  detector segment range has been estimated.
+     *  For 83dBf signal, the detector range is ~13-51% FS
+     *  For 29dBf signal, the detector range is ~ 8-46% FS
+     *  Full scale is 0x000000-0x7FFFFF.
+     */
+    multipath_min = 7723 * (uint32_t)level + 450000;
+    multipath_max = multipath_min + 3187670; /* 38% of FS */
+
+    i2c.start(DSP_I2C | I2C_WRITE);
+    i2c.write(ADDR1(DSP_FM_MULTIPATH));
+    i2c.write(ADDR2(DSP_FM_MULTIPATH));
+    i2c.write(ADDR3(DSP_FM_MULTIPATH));
+    i2c.restart(DSP_I2C | I2C_READ);
+    output = (uint32_t)i2c.read(false) << 16;
+    output |= (uint16_t)i2c.read(true) << 8;
+    output |= i2c.read(true);
+    i2c.stop();
+    output = constrain(output, multipath_min, multipath_max);
+    output = map(output, multipath_min, multipath_max, 0, 100);
+    return output;
+}
+
+int8_t dsp_read_usn()
+{
+    static int32_t last_value = -1;
+    uint32_t usn_min, usn_max, output, tmp;
+    if(mode != MODE_FM || current_filter != -1)
+    {
+        last_value = -1;
+        return -1;
+    }
+
+    i2c.start(DSP_I2C | I2C_WRITE);
+    i2c.write(ADDR1(DSP_ULTRASONIC_NOISE));
+    i2c.write(ADDR2(DSP_ULTRASONIC_NOISE));
+    i2c.write(ADDR3(DSP_ULTRASONIC_NOISE));
+    i2c.restart(DSP_I2C | I2C_READ);
+    output = (uint32_t)i2c.read(false) << 16;
+    output |= (uint16_t)i2c.read(true) << 8;
+    output |= i2c.read(true);
+    i2c.stop();
+
+    if(last_value != -1)
+    {
+        output += last_value;
+        output /= 2;
+    }
+
+    last_value = output;
+    usn_min = 251658;  /* 0.03 of FS */
+    usn_max = 3355442; /* 0.40 of FS */
+    output = constrain(output, usn_min, usn_max);
+    output = map(output, usn_min, usn_max, 0, 100);
+    return output;
+}
+
 void tune(uint8_t reset_flags)
 {
     i2c.start(DSP_I2C | I2C_WRITE);
@@ -807,7 +962,7 @@ void tune(uint8_t reset_flags)
 }
 
 bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
-{   
+{
     if ((freq>=55000) && (freq<=137000)) // FM BAND (extended)
     {
         if(freq % 50 || freq>108000 || scan_flag)
@@ -853,7 +1008,7 @@ bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
         return false;
     }
     align(freq);
-    
+
     /* reset RDS sync if tuning more than RDS_SYNC_RESET_kHz from previous frequency */
     if(abs((int32_t)(current_freq-freq)) > RDS_SYNC_RESET_kHz)
         tune(RESET_SIGNAL | RESET_RDS);
@@ -894,24 +1049,6 @@ uint32_t get_current_freq()
         return 10*(uint32_t)PLL/6-10700;
     else
         return 0;
-}
-
-void set_mode(uint8_t new_mode)
-{
-    if(mode != MODE_FM && mode != MODE_AM)
-        return;
-
-    mode = new_mode;
-    if(mode == MODE_FM)
-    {
-        dsp_write_data(DSP_FM);
-        current_filter = -1;
-        dsp_set_filter(current_filter);
-    }
-    else
-    {
-        dsp_write_data(DSP_AM);
-    }
 }
 
 void scan(bool continous)
@@ -959,7 +1096,49 @@ void scan(bool continous)
         dsp_write_16(DSP_VOLUME_SCALER, volume);
 }
 
-void ant_switch(uint8_t n)
+bool set_mode(uint8_t new_mode)
+{
+    if(mode != MODE_FM && mode != MODE_AM)
+        return false;
+    
+    mode = new_mode;
+    if(mode == MODE_FM)
+    {
+        dsp_write_data(DSP_FM);
+        current_filter = -1;
+        dsp_set_filter(current_filter);
+    }
+    else
+    {
+        dsp_write_data(DSP_AM);
+    }
+    return true;
+}
+
+void set_agc(uint8_t n)
+{
+    switch(n)
+    {
+    case 0: /* highest */
+        AGC &= B11110011;
+        break;
+    case 1: /* high */
+        AGC &= B11110111;
+        AGC |= B00000100;
+        break;
+    default:
+    case 2: /* medium */
+        AGC &= B11111011;
+        AGC |= B00001000;
+        break;
+    case 3: /* low */
+        AGC |= B00001100;
+        break;
+    }
+    tune(RESET_NONE);
+}
+
+void set_antenna(uint8_t n)
 {
     if(n < ANT_n)
     {
@@ -969,7 +1148,9 @@ void ant_switch(uint8_t n)
         signal_reset();
         delay(ANTENNA_SWITCH_DELAY);
         rds_sync_reset();
-        Serial.print("z\n");
+        Serial.print('Z');
+        Serial.print(n, DEC);
+        Serial.print('\n');
     }
 }
 
@@ -1098,3 +1279,4 @@ void zero()
     carrier(600);
     delayMicroseconds(600);
 }
+
