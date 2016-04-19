@@ -603,6 +603,9 @@ inline void handle_serial_command()
     case 'B':
         forced_mono = atol(buff+1);
         dsp_write_16(DSP_FORCE_MONO, (forced_mono ? DSP_TRUE : DSP_FALSE));
+        Serial.print('B');
+        Serial.print(forced_mono ? '1' : '0');
+        Serial.print('\n');
         break;
 
     case 'X':
@@ -1073,6 +1076,8 @@ void scan(bool continous)
         for(freq = scan_start; freq <= scan_end; freq += scan_step)
         {
             tune_freq(freq);
+            if(freq == scan_start)
+                delay(4);
             Serial.print(get_current_freq(), DEC);
             Serial.print('=');
             serial_signal(dsp_read_signal(LEVEL_FAST), 1);
