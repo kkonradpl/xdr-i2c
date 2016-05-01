@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2016-04-17
+ *  XDR-I2C 2016-04-20
  *  Copyright (C) 2012-2016  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
