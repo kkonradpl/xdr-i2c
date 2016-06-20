@@ -28,6 +28,8 @@
 #define TDSP1_X_CIBW_4_FirCtlFix 0x0101A5
 #define TDSP1_X_CIBW_4_pFirCtl   0x0101A6
 
+#define IR_POWER                 0xA8BC8
+
 // DSP initialization data
 const uint8_t DSP_INIT[] PROGMEM =
 {

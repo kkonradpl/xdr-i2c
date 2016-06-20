@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2016-04-20
+ *  XDR-I2C 2016-06-20
  *  Copyright (C) 2012-2016  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -175,12 +175,8 @@ void rds_sync_reset();
 void st_pilot();
 bool st_pilot_test(uint8_t);
 
-void sendcode(uint32_t);
-void carrier(int);
-void start();
-void one();
-void zero();
-
+void ir_sendcode(uint32_t);
+void ir_carrier(uint16_t);
 
 void setup()
 {
@@ -238,11 +234,7 @@ void setup()
 #endif
 
 #if IR
-    for(uint8_t i=0; i<10; i++)
-    {
-        sendcode(0xA8BC8);
-        delayMicroseconds(10000);
-    }
+    ir_sendcode(IR_POWER);
     delay(SLEEP_TIME*1000UL);
 #elif POWER
     digitalWrite(IR_PIN, HIGH);
@@ -1236,52 +1228,41 @@ bool st_pilot_test(uint8_t level)
     return dsp_read_16(DSP_ST_19kHz);
 }
 
-/* IR support by F4CMB */
-void sendcode(uint32_t code)
+/* IR support based on Olivier F4CMB's code */
+void ir_sendcode(uint32_t code)
 {
-    cli();
-    start();
-    for (int i = 19; i >=0; i--)
+    int8_t n, i;
+    for(n=0; n<3; n++)
     {
-        if (code>>i &1 == 1) one();
-        else zero();
+        cli();
+        ir_carrier(2400);
+        delayMicroseconds(600);
+        for(i=19; i>=0; i--)
+        {
+            ir_carrier(((code >> i) & 1) ? 1200 : 600);
+            delayMicroseconds(600);
+        }
+        sei();
+        delay(75);
     }
-    delayMicroseconds (15000);
-    start();
-    for (int i = 19; i >=0; i--)
-    {
-        if (code>>i &1 == 1) one();
-        else zero();
-    }
-    sei();
 }
 
-void carrier(int time)
+void ir_carrier(uint16_t time)
 {
-    for (int i=0; i<(time/30); i++)
+    uint8_t i;
+    for(i=0; i<(time/25); i++) /* approx. 40kHz */
     {
-        digitalWrite(IR_PIN, HIGH); // approx 40 KHz oscillator
+#if (IR_PIN >= 0 && IR_PIN <= 7)
+        PORTD |= (1<<IR_PIN);
+#else if(IR_PIN >= 8 && IR_PIN <= 13)
+        PORTB |= (1<<(IR_PIN-8));
+#endif
         delayMicroseconds(12);
-        digitalWrite(IR_PIN, LOW);
+#if (IR_PIN >= 0 && IR_PIN <= 7)
+        PORTD &= ~(1<<IR_PIN);
+#else if(IR_PIN >= 8 && IR_PIN <= 13)
+        PORTB &= ~(1<<(IR_PIN-8));
+#endif
         delayMicroseconds(12);
     }
 }
-
-void start()
-{
-    carrier(2000);
-    delayMicroseconds(600);
-}
-
-void one()
-{
-    carrier(1200);
-    delayMicroseconds(600);
-}
-
-void zero()
-{
-    carrier(600);
-    delayMicroseconds(600);
-}
-
