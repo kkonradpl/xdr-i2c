@@ -1,5 +1,5 @@
 /*
- *  XDR-I2C 2016-06-20
+ *  XDR-I2C 2016-07-24
  *  Copyright (C) 2012-2016  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
@@ -85,11 +85,14 @@ int8_t squelch_threshold = 0;
 uint8_t squelch_state = 0;
 
 /* RDS */
+#define RDS_SYNC_WAIT 10
+/* PI_BUFFER_SIZE must be a multiple of 8. */
 #define PI_BUFFER_SIZE 64
 #define RDS_SYNC_RESET_kHz 20
 uint8_t pi_buffer_fill = 0;
 uint8_t pi_pos = 0;
 bool pi_checked = false;
+uint32_t last_rds_reset = 0;
 
 /* Scan */
 bool scan_flag = false;
@@ -168,6 +171,7 @@ void set_antenna(uint8_t);
 
 void serial_hex(uint8_t);
 void serial_signal(float, uint8_t);
+void serial_pi(uint16_t, uint8_t);
 
 void signal_reset();
 void rds_sync_reset();
@@ -283,6 +287,8 @@ void loop()
 
 inline void handle_rds_interrupt()
 {
+    if((millis()-last_rds_reset) <= RDS_SYNC_WAIT)
+        return;
     if(!digitalRead(RDS_PIN))
         dsp_read_rds();
 }
@@ -759,12 +765,15 @@ void dsp_set_deemphasis(uint8_t d)
 void dsp_read_rds()
 {
     static uint16_t pi_buffer[PI_BUFFER_SIZE];
+    static uint8_t pi_buffer_errorfree[PI_BUFFER_SIZE/8];
+    static uint16_t pi_checked_val;
     static uint32_t rds_timer = 0;
     static uint8_t rds_buffer[4];
     static uint8_t rds_status_buffer;
     uint8_t status = dsp_read_16(DSP_RDS_STATUS);
     uint16_t buffer = dsp_read_16(DSP_RDS_DATA);
     uint8_t current_pi_count = 0;
+    uint8_t current_pi_errorfree = 0;
     uint8_t i;
 
     switch(status & B11111100)
@@ -772,29 +781,44 @@ void dsp_read_rds()
     case 0x00: /* fast PI mode block */
     case 0x80: /* block A */
         pi_buffer[pi_pos] = buffer;
+        if(status == 0x80)
+            pi_buffer_errorfree[pi_pos/8] |= (1 << (pi_pos%8));
+        else
+            pi_buffer_errorfree[pi_pos/8] &= ~(1 << (pi_pos%8));
+        pi_pos = (pi_pos+1)%PI_BUFFER_SIZE;
+
         if(pi_buffer_fill < PI_BUFFER_SIZE)
             pi_buffer_fill++;
 
         for(i=0; i<pi_buffer_fill; i++)
-            if(pi_buffer[i]==pi_buffer[pi_pos])
+        {
+            if(pi_buffer[i] == buffer)
+            {
                 current_pi_count++;
+                current_pi_errorfree += (pi_buffer_errorfree[i/8] & (1 << (i%8)) ? 1 : 0);
+            }
+        }
 
-        if(current_pi_count == 2 && !pi_checked)
+        if(current_pi_count >= 2 && current_pi_errorfree >= 2)
         {
-            Serial.print('P');
-            serial_hex(pi_buffer[pi_pos] >> 8);
-            serial_hex(pi_buffer[pi_pos] & 0xFF);
-            Serial.print("?\n");
-        }
-        else if(current_pi_count > 2)
-        {
-            Serial.print('P');
-            serial_hex(pi_buffer[pi_pos] >> 8);
-            serial_hex(pi_buffer[pi_pos] & 0xFF);
-            Serial.print('\n');
+            serial_pi(buffer, 0);
             pi_checked = true;
+            pi_checked_val = buffer;
         }
-        pi_pos = (pi_pos+1)%PI_BUFFER_SIZE;
+        else if(current_pi_count >= 2 && current_pi_errorfree == 1)
+        {
+            serial_pi(buffer, 1);
+        }
+        else if(current_pi_count >= 3 && !current_pi_errorfree)
+        {
+            serial_pi(buffer, 2);
+        }
+        else if((current_pi_errorfree && current_pi_count == 1) ||
+                (!current_pi_errorfree && current_pi_count == 2) ||
+                (pi_checked && pi_checked_val == buffer))
+        {
+            serial_pi(buffer, 3);
+        }
         break;
     case 0x84: /* block B */
         /* wait for block D before sending anything to the serial */
@@ -958,6 +982,7 @@ void tune(uint8_t reset_flags)
 
 bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
 {
+    int32_t diff = current_freq-freq;
     if ((freq>=55000) && (freq<=137000)) // FM BAND (extended)
     {
         if(freq % 50 || freq>108000 || scan_flag)
@@ -1004,8 +1029,9 @@ bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
     }
     align(freq);
 
-    /* reset RDS sync if tuning more than RDS_SYNC_RESET_kHz from previous frequency */
-    if(abs((int32_t)(current_freq-freq)) > RDS_SYNC_RESET_kHz)
+    /* reset RDS sync if tuning to the same frequency or
+       more than RDS_SYNC_RESET_kHz from previous frequency */
+    if(diff == 0 || diff >= RDS_SYNC_RESET_kHz || -diff >= RDS_SYNC_RESET_kHz)
         tune(RESET_SIGNAL | RESET_RDS);
     else
         tune(RESET_SIGNAL);
@@ -1168,6 +1194,16 @@ void serial_signal(float level, uint8_t precision)
     Serial.print(n, DEC);
 }
 
+void serial_pi(uint16_t pi, uint8_t err)
+{
+    Serial.print('P');
+    serial_hex(pi >> 8);
+    serial_hex(pi & 0xFF);
+    while(err--)
+        Serial.print('?');
+    Serial.print('\n');
+}
+
 void signal_reset()
 {
     uint8_t i;
@@ -1187,6 +1223,7 @@ void rds_sync_reset()
     pi_checked = false;
     pi_buffer_fill = 0;
     pi_pos = 0;
+    last_rds_reset = millis();
 }
 
 void st_pilot()
@@ -1254,13 +1291,13 @@ void ir_carrier(uint16_t time)
     {
 #if (IR_PIN >= 0 && IR_PIN <= 7)
         PORTD |= (1<<IR_PIN);
-#else if(IR_PIN >= 8 && IR_PIN <= 13)
+#elif (IR_PIN >= 8 && IR_PIN <= 13)
         PORTB |= (1<<(IR_PIN-8));
 #endif
         delayMicroseconds(12);
 #if (IR_PIN >= 0 && IR_PIN <= 7)
         PORTD &= ~(1<<IR_PIN);
-#else if(IR_PIN >= 8 && IR_PIN <= 13)
+#elif (IR_PIN >= 8 && IR_PIN <= 13)
         PORTB &= ~(1<<(IR_PIN-8));
 #endif
         delayMicroseconds(12);
