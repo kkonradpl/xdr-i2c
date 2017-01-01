@@ -81,6 +81,8 @@ uint8_t BAND;
 float level[SIGNAL_SAMPLE_COUNT];
 bool stereo[SIGNAL_SAMPLE_COUNT];
 uint8_t level_fast_countdown;
+bool level_fast = false;
+uint16_t sampling_custom = 0;
 int8_t squelch_threshold = 0;
 uint8_t squelch_state = 0;
 
@@ -381,22 +383,29 @@ inline void handle_signal_check()
     bool current_stereo;
     bool threshold_exceeded;
     float current_level;
+    uint16_t interval = (sampling_custom ? sampling_custom : TIMER_INTERVAL/SIGNAL_SAMPLE_COUNT);
 
-    /* Sample the signal level and ST subcarrier state
-     * every TIMER_INTERVAL/SIGNAL_SAMPLE_COUNT. */
-    if((current_timer-timer) < TIMER_INTERVAL/SIGNAL_SAMPLE_COUNT)
+    if((current_timer-timer) < interval)
         return;
 
-    /* At the beginning, use a fast response signal level detector, */
-    level[curr_pos] = dsp_read_signal(level_fast_countdown ? LEVEL_FAST : LEVEL_SLOW);
+    /* Always use fast response signal level detector for first few samples. */
+    level[curr_pos] = dsp_read_signal((level_fast_countdown || level_fast) ? LEVEL_FAST : LEVEL_SLOW);
     if(level_fast_countdown > 0)
         level_fast_countdown--;
 
     stereo[curr_pos] = (mode == MODE_FM && dsp_read_16(DSP_ST_19kHz));
-    /* At least 2/3 samples of stereo pilot detector should be positive */
-    current_stereo = ((stereo[0] && stereo[1]) ||
-                      (stereo[1] && stereo[2]) ||
-                      (stereo[0] && stereo[2]));
+    if(sampling_custom)
+    {
+        /* For custom sampling mode use only current value */
+        current_stereo = stereo[curr_pos];
+    }
+    else
+    {
+        /* At least 2/3 samples of stereo pilot detector should be positive */
+        current_stereo = ((stereo[0] && stereo[1]) ||
+                          (stereo[1] && stereo[2]) ||
+                          (stereo[0] && stereo[2]));
+    }
 
     /* Mute or unmute audio depending on a squelch (-1 is stereo, otherwise signal) */
     threshold_exceeded = ((squelch_threshold < 0) ? current_stereo : (level[curr_pos] >= squelch_threshold));
@@ -417,10 +426,11 @@ inline void handle_signal_check()
         }
     }
 
-    /* Send an averaged signal level to a serial every TIMER_INTERVAL */
-    if(!curr_pos)
+    if(!curr_pos || sampling_custom)
     {
-        if(level[0] >= 0.0 && level[1] >= 0.0 && level[2] >= 0.0)
+        if(sampling_custom)
+            current_level = level[curr_pos];
+        else if(level[0] >= 0.0 && level[1] >= 0.0 && level[2] >= 0.0)
             current_level = (level[0] + level[1] + level[2]) / 3.0;
         else
             current_level = ((level[prev_pos] >= 0.0) ? ((level[prev_pos] + level[curr_pos]) / 2.0) : level[curr_pos]);
@@ -447,6 +457,7 @@ inline void handle_serial_command()
     static char buff[SERIAL_BUFFER_SIZE];
     static uint8_t buff_pos = 0;
     uint8_t n;
+    char *ptr;
 
     if(!Serial.available())
         return;
@@ -603,6 +614,23 @@ inline void handle_serial_command()
         dsp_write_16(DSP_FORCE_MONO, (forced_mono ? DSP_TRUE : DSP_FALSE));
         Serial.print('B');
         Serial.print(forced_mono ? '1' : '0');
+        Serial.print('\n');
+        break;
+
+    case 'I':
+        sampling_custom = constrain(atol(buff+1), 0, 1000);
+        for(ptr = buff+1; *ptr != '\0'; ptr++)
+        {
+            if(*ptr == ',')
+            {
+                level_fast = (*(ptr+1) == '1');
+                break;
+            }
+        }
+        Serial.print('I');
+        Serial.print(sampling_custom, DEC);
+        Serial.print(',');
+        Serial.print(level_fast, DEC);
         Serial.print('\n');
         break;
 
@@ -1212,7 +1240,7 @@ void signal_reset()
         level[i] = -1.0;
         stereo[i] = false;
     }
-    level_fast_countdown = SIGNAL_SAMPLE_COUNT*3;
+    level_fast_countdown = 250 / (sampling_custom ? sampling_custom : (TIMER_INTERVAL/SIGNAL_SAMPLE_COUNT));
     if(squelch_state > SIGNAL_SAMPLE_COUNT)
         squelch_state = SIGNAL_SAMPLE_COUNT;
 }
