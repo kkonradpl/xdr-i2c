@@ -90,7 +90,7 @@ uint8_t squelch_state = 0;
 #define RDS_SYNC_WAIT 10
 /* PI_BUFFER_SIZE must be a multiple of 8. */
 #define PI_BUFFER_SIZE 64
-#define RDS_SYNC_RESET_kHz 20
+#define BUFF_RESET_FREQ_OFFSET 20
 uint8_t pi_buffer_fill = 0;
 uint8_t pi_pos = 0;
 bool pi_checked = false;
@@ -1001,7 +1001,7 @@ void tune(uint8_t reset_flags)
 
     if(!scan_flag)
     {
-        if(reset_flags & RESET_RDS)
+        if(reset_flags & RESET_RDS && mode == MODE_FM)
             rds_sync_reset();
         if(reset_flags & RESET_SIGNAL)
             signal_reset();
@@ -1010,7 +1010,9 @@ void tune(uint8_t reset_flags)
 
 bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
 {
-    int32_t diff = current_freq-freq;
+    int32_t diff;
+    uint8_t flags = 0;
+
     if ((freq>=55000) && (freq<=137000)) // FM BAND (extended)
     {
         if(freq % 50 || freq>108000 || scan_flag)
@@ -1055,15 +1057,15 @@ bool tune_freq(uint32_t freq) // ***Modified by F4CMB***
     {
         return false;
     }
+
+    /* Reset buffers when tuning to the same frequency or more
+       than BUFF_RESET_FREQ_OFFSET kHz from previous frequency */
+    diff = current_freq-freq;
+    if(diff == 0 || diff >= BUFF_RESET_FREQ_OFFSET || -diff >= BUFF_RESET_FREQ_OFFSET)
+        flags |= (RESET_RDS | RESET_SIGNAL);
+
     align(freq);
-
-    /* reset RDS sync if tuning to the same frequency or
-       more than RDS_SYNC_RESET_kHz from previous frequency */
-    if(diff == 0 || diff >= RDS_SYNC_RESET_kHz || -diff >= RDS_SYNC_RESET_kHz)
-        tune(RESET_SIGNAL | RESET_RDS);
-    else
-        tune(RESET_SIGNAL);
-
+    tune(flags);
     return true;
 }
 
