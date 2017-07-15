@@ -93,7 +93,7 @@ uint8_t squelch_state = 0;
 #define BUFF_RESET_FREQ_OFFSET 20
 uint8_t pi_buffer_fill = 0;
 uint8_t pi_pos = 0;
-bool pi_checked = false;
+int8_t pi_state = -1;
 uint32_t last_rds_reset = 0;
 
 /* Scan */
@@ -131,6 +131,12 @@ int8_t rotator_req = -1;
 #define RESET_NONE   (0)
 #define RESET_SIGNAL (1 << 0)
 #define RESET_RDS    (1 << 1)
+
+#define PI_NONE       -1
+#define PI_UNLIKELY    0
+#define PI_LIKELY      1
+#define PI_VERY_LIKELY 2
+#define PI_CORRECT     3
 
 #ifndef M_E
 #define M_E 2.71828182845905
@@ -794,7 +800,7 @@ void dsp_read_rds()
 {
     static uint16_t pi_buffer[PI_BUFFER_SIZE];
     static uint8_t pi_buffer_errorfree[PI_BUFFER_SIZE/8];
-    static uint16_t pi_checked_val;
+    static uint16_t pi_val;
     static uint32_t rds_timer = 0;
     static uint8_t rds_buffer[4];
     static uint8_t rds_status_buffer;
@@ -802,6 +808,7 @@ void dsp_read_rds()
     uint16_t buffer = dsp_read_16(DSP_RDS_DATA);
     uint8_t current_pi_count = 0;
     uint8_t current_pi_errorfree = 0;
+    int8_t current_pi_state;
     uint8_t i;
 
     switch(status & B11111100)
@@ -828,24 +835,23 @@ void dsp_read_rds()
         }
 
         if(current_pi_count >= 2 && current_pi_errorfree >= 2)
-        {
-            serial_pi(buffer, 0);
-            pi_checked = true;
-            pi_checked_val = buffer;
-        }
+            current_pi_state = PI_CORRECT;
         else if(current_pi_count >= 2 && current_pi_errorfree == 1)
-        {
-            serial_pi(buffer, 1);
-        }
+            current_pi_state = PI_VERY_LIKELY;
         else if(current_pi_count >= 3 && !current_pi_errorfree)
-        {
-            serial_pi(buffer, 2);
-        }
+            current_pi_state = PI_LIKELY;
         else if((current_pi_errorfree && current_pi_count == 1) ||
                 (!current_pi_errorfree && current_pi_count == 2) ||
-                (pi_checked && pi_checked_val == buffer))
+                (pi_state == PI_CORRECT && pi_val == buffer))
+            current_pi_state = PI_UNLIKELY;
+        else
+            break;
+
+        serial_pi(buffer, current_pi_state);
+        if(pi_state <= current_pi_state)
         {
-            serial_pi(buffer, 3);
+            pi_state = current_pi_state;
+            pi_val = buffer;
         }
         break;
     case 0x84: /* block B */
@@ -864,20 +870,30 @@ void dsp_read_rds()
         rds_status_buffer |= (status&B11) << 2;
         break;
     case 0x8C: /* block D */
-        /* is this block related to the block B from buffer? */
-        if((millis()-rds_timer) < 50)
+        /* Is this block related to the block B from buffer? */
+        if((millis()-rds_timer) > 50)
+            break;
+
+        /* Is there any valid PI code in the buffer? */
+        if(pi_state < PI_LIKELY)
+            break;
+        for(i=0; i<pi_buffer_fill; i++)
         {
-            rds_status_buffer &= B001111;
-            rds_status_buffer |= (status&B11) << 4;
-            Serial.print('R');
-            serial_hex(rds_buffer[0]);
-            serial_hex(rds_buffer[1]);
-            serial_hex(rds_buffer[2]);
-            serial_hex(rds_buffer[3]);
-            serial_hex(buffer >> 8);
-            serial_hex(buffer);
-            serial_hex(rds_status_buffer);
-            Serial.print('\n');
+            if(pi_buffer[i] == pi_val)
+            {
+                rds_status_buffer &= B001111;
+                rds_status_buffer |= (status&B11) << 4;
+                Serial.print('R');
+                serial_hex(rds_buffer[0]);
+                serial_hex(rds_buffer[1]);
+                serial_hex(rds_buffer[2]);
+                serial_hex(rds_buffer[3]);
+                serial_hex(buffer >> 8);
+                serial_hex(buffer);
+                serial_hex(rds_status_buffer);
+                Serial.print('\n');
+                break;
+            }
         }
         break;
     }
@@ -1229,6 +1245,7 @@ void serial_pi(uint16_t pi, uint8_t err)
     Serial.print('P');
     serial_hex(pi >> 8);
     serial_hex(pi & 0xFF);
+    err = PI_CORRECT - err;
     while(err--)
         Serial.print('?');
     Serial.print('\n');
@@ -1250,7 +1267,7 @@ void signal_reset()
 void rds_sync_reset()
 {
     dsp_write_16(DSP_RDS_CONTROL, 0x0060); // fast pi mode
-    pi_checked = false;
+    pi_state = PI_NONE;
     pi_buffer_fill = 0;
     pi_pos = 0;
     last_rds_reset = millis();
