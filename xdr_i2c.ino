@@ -1,6 +1,6 @@
 /*
- *  XDR-I2C 2016-07-24
- *  Copyright (C) 2012-2016  Konrad Kosmatka
+ *  XDR-I2C 2017-07-15
+ *  Copyright (C) 2012-2017  Konrad Kosmatka
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -102,6 +102,7 @@ uint32_t scan_start = 0;
 uint32_t scan_end = 0;
 uint8_t scan_step = 0;
 uint8_t scan_filter = 0;
+int8_t scan_antenna = -1;
 
 /* Antenna switch */
 const uint8_t ANT[] = {ANT_A_PIN, ANT_B_PIN, ANT_C_PIN, ANT_D_PIN};
@@ -577,6 +578,8 @@ inline void handle_serial_command()
             scan_step = atol(buff+2);
         else if(buff[1] == 'f')
             scan_filter = atol(buff+2);
+        else if(buff[1] == 'z')
+            scan_antenna = atol(buff+2);
         else if(scan_start > 0 && scan_end > 0 && scan_step > 0 && scan_filter >= 0)
             scan((buff[1] == 'm'));
         break;
@@ -1127,9 +1130,14 @@ void scan(bool continous)
     uint8_t _AGC = AGC;
     uint8_t _BAND = BAND;
     uint32_t freq;
+    uint8_t ant;
 
     if(squelch_state) /* mute audio during scan */
         dsp_write_16(DSP_VOLUME_SCALER, 0);
+
+    ant = current_ant;
+    if(scan_antenna != -1 && current_ant != scan_antenna)
+        set_antenna(scan_antenna);
 
     scan_flag = true;
     dsp_set_filter(scan_filter);
@@ -1151,6 +1159,9 @@ void scan(bool continous)
     }
     while(continous && !Serial.available());
     scan_flag = false;
+
+    if(current_ant != ant)
+        set_antenna(ant);
 
     /* restore saved IF settings */
     dsp_set_filter(current_filter);
@@ -1215,11 +1226,11 @@ void set_antenna(uint8_t n)
         digitalWrite(ANT[n], HIGH);
         current_ant = n;
         signal_reset();
-        delay(ANTENNA_SWITCH_DELAY);
-        rds_sync_reset();
         Serial.print('Z');
         Serial.print(n, DEC);
         Serial.print('\n');
+        delay(ANTENNA_SWITCH_DELAY);
+        rds_sync_reset();
     }
 }
 
