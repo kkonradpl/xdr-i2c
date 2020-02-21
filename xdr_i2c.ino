@@ -566,7 +566,7 @@ inline void handle_serial_command()
             Serial.print('0');
         }
         Serial.print('\n');
-        tune(RESET_NONE);
+        tune(RESET_SIGNAL);
         break;
 
     case 'S':
